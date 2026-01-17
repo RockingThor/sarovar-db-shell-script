@@ -410,7 +410,7 @@ function Get-TableRowCount {
         [string]$TableName
     )
     
-    $query = "SELECT COUNT(*) AS RowCount FROM [$Schema].[$TableName]"
+    $query = "SELECT COUNT(*) AS [RowCount] FROM [$Schema].[$TableName]"
     $result = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Query $query
     return $result.RowCount
 }
