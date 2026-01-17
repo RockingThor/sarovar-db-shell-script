@@ -1,0 +1,39 @@
+{
+  "_comment": "MSSQL to S3 Backup Configuration - Copy this file to config.json and update values",
+
+  "server_identifier": "SERVER-001",
+  "_server_identifier_help": "Unique identifier for this server. Used in S3 path. Defaults to hostname if empty.",
+
+  "sql_server": "localhost",
+  "_sql_server_help": "MSSQL Server instance name. Use 'localhost' for local, or 'SERVER\\INSTANCE' for named instances.",
+
+  "databases": ["Database1", "Database2"],
+  "_databases_help": "List of database names to backup. All user tables in each database will be exported.",
+
+  "s3_bucket": "your-bucket-name",
+  "_s3_bucket_help": "S3 bucket name (without s3:// prefix).",
+
+  "s3_region": "us-east-1",
+  "_s3_region_help": "AWS region where the S3 bucket is located.",
+
+  "s3_prefix": "backups",
+  "_s3_prefix_help": "Prefix/folder path within the bucket. Final path: s3://bucket/prefix/server/database/date/table.csv",
+
+  "aws_access_key": "AKIAXXXXXXXXXXXXXXXX",
+  "_aws_access_key_help": "AWS Access Key ID with write permissions to the S3 bucket.",
+
+  "aws_secret_key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "_aws_secret_key_help": "AWS Secret Access Key.",
+
+  "temp_directory": "C:\\SarovarBackup\\temp",
+  "_temp_directory_help": "Local directory for temporary CSV files during export. Files are deleted after upload.",
+
+  "log_directory": "C:\\SarovarBackup\\logs",
+  "_log_directory_help": "Directory for backup log files.",
+
+  "log_retention_days": 30,
+  "_log_retention_days_help": "Number of days to keep log files. Set to 0 to disable cleanup.",
+
+  "backup_time": "02:00",
+  "_backup_time_help": "Time to run daily backup (24-hour format). Used by installer to create scheduled task."
+}
