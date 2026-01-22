@@ -6,6 +6,7 @@ Automated daily backup of MSSQL database tables to Amazon S3 using pure PowerShe
 
 - **Zero External Dependencies**: Uses native PowerShell with direct S3 REST API calls (AWS Signature V4)
 - **Simple Installation**: One-command installer with automatic Task Scheduler setup
+- **Production-Ready Validation**: Validates S3 connectivity and permissions before installation
 - **Mass Deployment Ready**: Silent mode for deploying to 140+ servers
 - **Full Table Export**: Exports all tables from specified databases to CSV format
 - **Restoration Support**: Restore data to any MSSQL server from S3 backups
@@ -29,6 +30,12 @@ Automated daily backup of MSSQL database tables to Amazon S3 using pure PowerShe
    - S3 bucket and AWS credentials
    - Backup schedule time
 
+5. The installer will automatically:
+   - Test SQL Server connectivity
+   - **Validate S3 connectivity and write permissions** (before installation)
+   - Create installation directories
+   - Set up scheduled task
+
 ### Silent Installation (for Mass Deployment)
 
 ```powershell
@@ -40,6 +47,8 @@ Automated daily backup of MSSQL database tables to Amazon S3 using pure PowerShe
     -AwsSecretKey "your-secret-key" `
     -BackupTime "02:00"
 ```
+
+**Note**: In silent mode, the installer will **fail immediately** if S3 connectivity test fails, preventing incomplete installations in production environments.
 
 ## File Structure
 
@@ -100,6 +109,8 @@ Configuration is stored in `config.json`:
 ```powershell
 & "C:\SarovarBackup\backup-to-s3.ps1" -ConfigPath "C:\SarovarBackup\config.json" -TestOnly
 ```
+
+**Note**: The installer also performs this connectivity test automatically during installation, before any files are copied or configured.
 
 ### List Available Backups
 
@@ -228,6 +239,7 @@ Create an IAM user/role with this policy:
 - **SQL Server** with Windows Authentication configured
 - **SqlServer PowerShell Module** (installer will attempt to install if missing)
 - **Network access** to `s3.{region}.amazonaws.com` on port 443
+- **Valid AWS credentials** with S3 write permissions (tested during installation)
 
 ## Uninstallation
 
@@ -243,6 +255,29 @@ Create an IAM user/role with this policy:
 ```
 
 ## Troubleshooting
+
+### Installation Fails with S3 Connectivity Error
+
+The installer validates S3 connectivity **before** installation. If this fails:
+
+- **403 Forbidden / Access Denied**: 
+  - Verify AWS credentials are correct
+  - Check IAM user has `s3:PutObject` permission
+  - Verify bucket policy allows the IAM user
+- **404 Not Found**: 
+  - Verify bucket name is correct
+  - Ensure bucket exists in the specified region
+- **401 Unauthorized**: 
+  - Check AWS Access Key and Secret Key are valid
+  - Verify credentials haven't been rotated
+- **Network/Timeout Errors**: 
+  - Check firewall allows outbound HTTPS (port 443) to `s3.{region}.amazonaws.com`
+  - Verify internet connectivity
+  - Check proxy settings if behind corporate firewall
+
+**In Silent Mode**: Installation will exit immediately if S3 test fails. Fix connectivity issues before retrying.
+
+**In Interactive Mode**: You can choose to continue installation despite S3 test failure, but backups will not work until connectivity is fixed.
 
 ### Backup Fails with "Access Denied"
 

@@ -129,6 +129,259 @@ function Test-SqlConnection {
     }
 }
 
+#region ==================== AWS SIGNATURE V4 HELPERS ====================
+
+function Get-SHA256Hash {
+    param([byte[]]$Data)
+    
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $hash = $sha256.ComputeHash($Data)
+    return [BitConverter]::ToString($hash).Replace("-", "").ToLower()
+}
+
+function Get-SHA256HashFromFile {
+    param([string]$FilePath)
+    
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($FilePath)
+    try {
+        $hash = $sha256.ComputeHash($stream)
+        return [BitConverter]::ToString($hash).Replace("-", "").ToLower()
+    }
+    finally {
+        $stream.Close()
+    }
+}
+
+function Get-HMACSHA256 {
+    param(
+        [byte[]]$Key,
+        [string]$Message
+    )
+    
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+    $hmac.Key = $Key
+    return $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Message))
+}
+
+function Get-SignatureKey {
+    param(
+        [string]$SecretKey,
+        [string]$DateStamp,
+        [string]$Region,
+        [string]$Service
+    )
+    
+    $kSecret = [System.Text.Encoding]::UTF8.GetBytes("AWS4$SecretKey")
+    $kDate = Get-HMACSHA256 -Key $kSecret -Message $DateStamp
+    $kRegion = Get-HMACSHA256 -Key $kDate -Message $Region
+    $kService = Get-HMACSHA256 -Key $kRegion -Message $Service
+    $kSigning = Get-HMACSHA256 -Key $kService -Message "aws4_request"
+    
+    return $kSigning
+}
+
+function Get-AWSSignatureV4 {
+    param(
+        [string]$Method,
+        [string]$Uri,
+        [string]$Region,
+        [string]$Service,
+        [string]$AccessKey,
+        [string]$SecretKey,
+        [hashtable]$Headers,
+        [string]$PayloadHash,
+        [string]$QueryString = ""
+    )
+    
+    $now = [DateTime]::UtcNow
+    $dateStamp = $now.ToString("yyyyMMdd")
+    $amzDate = $now.ToString("yyyyMMddTHHmmssZ")
+    
+    # Parse URI
+    $uriObj = [System.Uri]$Uri
+    $canonicalUri = $uriObj.AbsolutePath
+    if ([string]::IsNullOrEmpty($canonicalUri)) { $canonicalUri = "/" }
+    
+    # Canonical query string
+    $canonicalQueryString = $QueryString
+    
+    # Canonical headers
+    $Headers["x-amz-date"] = $amzDate
+    $Headers["x-amz-content-sha256"] = $PayloadHash
+    
+    $sortedHeaders = $Headers.GetEnumerator() | Sort-Object Name
+    $canonicalHeaders = ($sortedHeaders | ForEach-Object { "$($_.Name.ToLower()):$($_.Value.Trim())" }) -join "`n"
+    $canonicalHeaders += "`n"
+    
+    $signedHeaders = ($sortedHeaders | ForEach-Object { $_.Name.ToLower() }) -join ";"
+    
+    # Create canonical request
+    $canonicalRequest = @(
+        $Method,
+        $canonicalUri,
+        $canonicalQueryString,
+        $canonicalHeaders,
+        $signedHeaders,
+        $PayloadHash
+    ) -join "`n"
+    
+    # Create string to sign
+    $algorithm = "AWS4-HMAC-SHA256"
+    $credentialScope = "$dateStamp/$Region/$Service/aws4_request"
+    $canonicalRequestHash = Get-SHA256Hash -Data ([System.Text.Encoding]::UTF8.GetBytes($canonicalRequest))
+    
+    $stringToSign = @(
+        $algorithm,
+        $amzDate,
+        $credentialScope,
+        $canonicalRequestHash
+    ) -join "`n"
+    
+    # Calculate signature
+    $signingKey = Get-SignatureKey -SecretKey $SecretKey -DateStamp $dateStamp -Region $Region -Service $Service
+    $signatureBytes = Get-HMACSHA256 -Key $signingKey -Message $stringToSign
+    $signature = [BitConverter]::ToString($signatureBytes).Replace("-", "").ToLower()
+    
+    # Create authorization header
+    $authorization = "$algorithm Credential=$AccessKey/$credentialScope, SignedHeaders=$signedHeaders, Signature=$signature"
+    
+    return @{
+        Authorization = $authorization
+        AmzDate = $amzDate
+        AmzContentSha256 = $PayloadHash
+    }
+}
+
+#endregion
+
+function Test-S3Connectivity {
+    param(
+        [string]$BucketName,
+        [string]$AccessKey,
+        [string]$SecretKey,
+        [string]$Region,
+        [string]$S3Prefix = "backups"
+    )
+    
+    try {
+        Write-Status "Testing S3 connectivity and write permissions..." "Info"
+        
+        # Create test file
+        $testKey = "$S3Prefix/_install_test_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
+        $testContent = "Installation connectivity test - $(Get-Date -Format 'o')"
+        $testFile = Join-Path $env:TEMP "_s3_test_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
+        
+        Set-Content -Path $testFile -Value $testContent -Encoding UTF8
+        
+        # Calculate payload hash from file
+        $payloadHash = Get-SHA256HashFromFile -FilePath $testFile
+        
+        # Build endpoint URL (path-style for compatibility)
+        $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$testKey"
+        
+        $headers = @{
+            "Host" = "s3.$Region.amazonaws.com"
+            "Content-Type" = "text/plain"
+        }
+        
+        $authResult = Get-AWSSignatureV4 `
+            -Method "PUT" `
+            -Uri $endpoint `
+            -Region $Region `
+            -Service "s3" `
+            -AccessKey $AccessKey `
+            -SecretKey $SecretKey `
+            -Headers $headers `
+            -PayloadHash $payloadHash
+        
+        $requestHeaders = @{
+            "Authorization" = $authResult.Authorization
+            "x-amz-date" = $authResult.AmzDate
+            "x-amz-content-sha256" = $authResult.AmzContentSha256
+            "Content-Type" = "text/plain"
+            "Host" = "s3.$Region.amazonaws.com"
+        }
+        
+        # Upload test file
+        $fileBytes = [System.IO.File]::ReadAllBytes($testFile)
+        Invoke-RestMethod `
+            -Uri $endpoint `
+            -Method PUT `
+            -Headers $requestHeaders `
+            -Body $fileBytes `
+            -ContentType "text/plain" `
+            -ErrorAction Stop | Out-Null
+        
+        # Clean up local test file
+        Remove-Item $testFile -Force -ErrorAction SilentlyContinue
+        
+        # Try to delete the test file from S3 (optional cleanup)
+        try {
+            $deleteEndpoint = "https://s3.$Region.amazonaws.com/$BucketName/$testKey"
+            $deletePayloadHash = Get-SHA256Hash -Data ([byte[]]@())
+            
+            $deleteHeaders = @{
+                "Host" = "s3.$Region.amazonaws.com"
+            }
+            
+            $deleteAuthResult = Get-AWSSignatureV4 `
+                -Method "DELETE" `
+                -Uri $deleteEndpoint `
+                -Region $Region `
+                -Service "s3" `
+                -AccessKey $AccessKey `
+                -SecretKey $SecretKey `
+                -Headers $deleteHeaders `
+                -PayloadHash $deletePayloadHash
+            
+            $deleteRequestHeaders = @{
+                "Authorization" = $deleteAuthResult.Authorization
+                "x-amz-date" = $deleteAuthResult.AmzDate
+                "x-amz-content-sha256" = $deleteAuthResult.AmzContentSha256
+                "Host" = "s3.$Region.amazonaws.com"
+            }
+            
+            Invoke-RestMethod `
+                -Uri $deleteEndpoint `
+                -Method DELETE `
+                -Headers $deleteRequestHeaders `
+                -ErrorAction SilentlyContinue | Out-Null
+        }
+        catch {
+            # Ignore delete errors - test file can remain in S3
+        }
+        
+        Write-Status "S3 connectivity test successful - bucket is accessible and writable" "Success"
+        return $true
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        if ($_.Exception.Response) {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            $errorMessage = "HTTP $statusCode : $errorMessage"
+        }
+        
+        Write-Status "S3 connectivity test failed: $errorMessage" "Error"
+        
+        # Provide helpful error messages
+        if ($errorMessage -like "*403*" -or $errorMessage -like "*Forbidden*") {
+            Write-Status "Access denied - check AWS credentials and bucket permissions" "Error"
+        }
+        elseif ($errorMessage -like "*404*" -or $errorMessage -like "*Not Found*") {
+            Write-Status "Bucket not found - verify bucket name and region" "Error"
+        }
+        elseif ($errorMessage -like "*401*" -or $errorMessage -like "*Unauthorized*") {
+            Write-Status "Authentication failed - verify AWS Access Key and Secret Key" "Error"
+        }
+        elseif ($errorMessage -like "*timeout*" -or $errorMessage -like "*network*") {
+            Write-Status "Network error - check internet connectivity and firewall settings" "Error"
+        }
+        
+        return $false
+    }
+}
+
 function Read-SecureInput {
     param([string]$Prompt)
     
@@ -312,6 +565,36 @@ function Main {
         $InstallPath = $inputInstallPath
     }
     
+    # Test S3 connectivity BEFORE installation
+    Write-Host ""
+    Write-Host "--- Testing S3 Connectivity ---" -ForegroundColor Yellow
+    Write-Host ""
+    
+    $s3TestResult = Test-S3Connectivity `
+        -BucketName $config.s3_bucket `
+        -AccessKey $config.aws_access_key `
+        -SecretKey $config.aws_secret_key `
+        -Region $config.s3_region `
+        -S3Prefix $config.s3_prefix
+    
+    if (-not $s3TestResult) {
+        Write-Status "S3 connectivity test failed" "Error"
+        Write-Status "Cannot proceed with installation without S3 access" "Error"
+        
+        if ($Silent) {
+            Write-Status "Silent mode: Exiting due to S3 connectivity failure" "Error"
+            exit 1
+        }
+        else {
+            $continue = Read-Host "Continue with installation anyway? (y/N)"
+            if ($continue -ne 'y') {
+                Write-Status "Installation cancelled by user" "Warning"
+                exit 1
+            }
+            Write-Status "Proceeding with installation despite S3 test failure" "Warning"
+        }
+    }
+    
     Write-Host ""
     Write-Host "--- Installing ---" -ForegroundColor Yellow
     Write-Host ""
@@ -387,21 +670,6 @@ function Main {
     }
     catch {
         Write-Status "Could not restrict config file permissions: $_" "Warning"
-    }
-    
-    # Test S3 connection
-    Write-Status "Testing S3 connection..." "Info"
-    try {
-        & $destScript -ConfigPath $configPath -TestOnly
-        Write-Status "S3 connection successful" "Success"
-    }
-    catch {
-        Write-Status "S3 connection test failed: $_" "Warning"
-        Write-Status "Please verify AWS credentials and bucket permissions" "Warning"
-        if (-not $Silent) {
-            $continue = Read-Host "Continue with installation? (y/N)"
-            if ($continue -ne 'y') { exit 1 }
-        }
     }
     
     # Create scheduled task
