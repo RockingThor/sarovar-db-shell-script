@@ -1,16 +1,21 @@
-# MSSQL to S3 Backup Solution
+# SQL Server BAK File to S3 Backup Solution
 
-Automated daily backup of MSSQL database tables to Amazon S3 using pure PowerShell - **no AWS CLI or external dependencies required**.
+Automated daily upload of SQL Server .bak backup files to Amazon S3 using pure PowerShell - **no AWS CLI or external dependencies required**.
 
 ## Features
 
 - **Zero External Dependencies**: Uses native PowerShell with direct S3 REST API calls (AWS Signature V4)
 - **Simple Installation**: One-command installer with automatic Task Scheduler setup
-- **Production-Ready Validation**: Validates S3 connectivity and permissions before installation
-- **Mass Deployment Ready**: Silent mode for deploying to 140+ servers
-- **Full Table Export**: Exports all tables from specified databases to CSV format
-- **Restoration Support**: Restore data to any MSSQL server from S3 backups
-- **Secure**: Windows Authentication for SQL, restricted config file permissions
+- **Firewall Validation**: Tests S3 connectivity before installation to ensure network access
+- **Mass Deployment Ready**: Silent mode for deploying to multiple servers
+- **Automatic Latest File Detection**: Finds and uploads the latest .bak file from your backup directory
+- **Secure**: Restricted config file permissions, HTTPS-only S3 communication
+
+## How It Works
+
+1. SQL Server Agent creates .bak files in a designated directory (your existing backup process)
+2. This solution runs on a schedule and uploads the **latest** .bak file to S3
+3. Files are organized in S3 by server name and date
 
 ## Quick Start
 
@@ -25,14 +30,13 @@ Automated daily backup of MSSQL database tables to Amazon S3 using pure PowerShe
 ```
 
 4. Follow the prompts to configure:
-   - SQL Server instance
-   - Database names to backup
-   - S3 bucket and AWS credentials
-   - Backup schedule time
+   - **Step 1**: S3 bucket name, region, and AWS credentials
+   - **Step 2**: Automatic S3 connectivity/firewall test
+   - **Step 3**: Path where SQL Agent creates .bak files
+   - **Step 4**: Schedule time for daily uploads
 
 5. The installer will automatically:
-   - Test SQL Server connectivity
-   - **Validate S3 connectivity and write permissions** (before installation)
+   - **Validate S3 connectivity and firewall access** (before installation)
    - Create installation directories
    - Set up scheduled task
 
@@ -42,23 +46,21 @@ Automated daily backup of MSSQL database tables to Amazon S3 using pure PowerShe
 .\install.ps1 -Silent `
     -S3Bucket "your-bucket-name" `
     -S3Region "us-east-1" `
-    -Databases "DB1,DB2,DB3" `
+    -BakFilePath "D:\SQLBackups" `
     -AwsAccessKey "AKIAXXXXXXXX" `
     -AwsSecretKey "your-secret-key" `
     -BackupTime "02:00"
 ```
 
-**Note**: In silent mode, the installer will **fail immediately** if S3 connectivity test fails, preventing incomplete installations in production environments.
+**Note**: In silent mode, the installer will **fail immediately** if S3 connectivity test fails, preventing incomplete installations.
 
 ## File Structure
 
 ```
 C:\SarovarBackup\           # Default installation directory
 ├── backup-to-s3.ps1        # Main backup script
-├── restore-from-s3.ps1     # Restore script
 ├── uninstall.ps1           # Uninstaller
 ├── config.json             # Configuration (secured)
-├── temp\                   # Temporary CSV files (auto-cleaned)
 └── logs\                   # Backup logs
 ```
 
@@ -67,12 +69,8 @@ C:\SarovarBackup\           # Default installation directory
 ```
 s3://bucket-name/backups/
 └── SERVER-001/
-    ├── _manifest_2026-01-16.json    # Backup metadata
-    └── DatabaseName/
-        └── 2026-01-16/
-            ├── dbo_Customers.csv
-            ├── dbo_Orders.csv
-            └── dbo_Products.csv
+    └── 2026-01-29/
+        └── DatabaseName_Full_20260129.bak
 ```
 
 ## Configuration
@@ -82,14 +80,12 @@ Configuration is stored in `config.json`:
 ```json
 {
     "server_identifier": "SERVER-001",
-    "sql_server": "localhost",
-    "databases": ["Database1", "Database2"],
+    "bak_file_path": "D:\\SQLBackups",
     "s3_bucket": "your-bucket-name",
     "s3_region": "us-east-1",
     "s3_prefix": "backups",
     "aws_access_key": "AKIAXXXXXXXX",
     "aws_secret_key": "your-secret-key",
-    "temp_directory": "C:\\SarovarBackup\\temp",
     "log_directory": "C:\\SarovarBackup\\logs",
     "log_retention_days": 30,
     "backup_time": "02:00"
@@ -110,59 +106,9 @@ Configuration is stored in `config.json`:
 & "C:\SarovarBackup\backup-to-s3.ps1" -ConfigPath "C:\SarovarBackup\config.json" -TestOnly
 ```
 
-**Note**: The installer also performs this connectivity test automatically during installation, before any files are copied or configured.
+## Mass Deployment
 
-### List Available Backups
-
-```powershell
-& "C:\SarovarBackup\restore-from-s3.ps1" -ListOnly
-```
-
-### Restore Data
-
-```powershell
-# Restore all tables from a specific date
-& "C:\SarovarBackup\restore-from-s3.ps1" -Date "2026-01-15" -Database "SalesDB"
-
-# Restore specific tables
-& "C:\SarovarBackup\restore-from-s3.ps1" -Date "2026-01-15" -Database "SalesDB" -Tables "Customers,Orders"
-
-# Restore to a different server
-& "C:\SarovarBackup\restore-from-s3.ps1" -Date "2026-01-15" -Database "SalesDB" -TargetServer "NewServer\SQLEXPRESS" -TargetDatabase "SalesDB_Restored"
-
-# Truncate and restore (clean import)
-& "C:\SarovarBackup\restore-from-s3.ps1" -Date "2026-01-15" -Database "SalesDB" -TruncateBeforeImport
-```
-
-## Mass Deployment (140+ Servers)
-
-### Option 1: Network Share with Per-Server Configs
-
-1. Create config files for each server on a network share:
-   ```
-   \\fileserver\backup-configs\
-   ├── SERVER-001.json
-   ├── SERVER-002.json
-   └── ...
-   ```
-
-2. Deploy using remote PowerShell:
-   ```powershell
-   $servers = Get-Content "servers.txt"
-   
-   foreach ($server in $servers) {
-       Invoke-Command -ComputerName $server -ScriptBlock {
-           # Copy installer from network share
-           Copy-Item "\\fileserver\scripts\*" "C:\temp\backup-install\" -Recurse
-           
-           # Run silent installation
-           & "C:\temp\backup-install\install.ps1" -Silent `
-               -ConfigFile "\\fileserver\backup-configs\$env:COMPUTERNAME.json"
-       }
-   }
-   ```
-
-### Option 2: Parameterized Mass Deploy
+### Option 1: Parameterized Mass Deploy
 
 ```powershell
 $servers = Get-Content "servers.txt"
@@ -175,30 +121,27 @@ $commonParams = @{
 }
 
 foreach ($server in $servers) {
-    # Get databases for this server (customize as needed)
-    $databases = Get-ServerDatabases $server
-    
     Invoke-Command -ComputerName $server -ScriptBlock {
-        param($params, $dbs)
+        param($params)
         
         & "C:\temp\install.ps1" -Silent `
             -S3Bucket $params.S3Bucket `
             -S3Region $params.S3Region `
-            -Databases ($dbs -join ",") `
+            -BakFilePath "D:\SQLBackups" `
             -AwsAccessKey $params.AwsAccessKey `
             -AwsSecretKey $params.AwsSecretKey `
             -BackupTime $params.BackupTime `
             -ServerIdentifier $env:COMPUTERNAME
             
-    } -ArgumentList $commonParams, $databases
+    } -ArgumentList $commonParams
 }
 ```
 
-### Option 3: Group Policy / SCCM
+### Option 2: Group Policy / SCCM
 
 1. Create a startup script that runs the installer
 2. Deploy via GPO or SCCM
-3. Use environment variables or config file for customization
+3. Use parameters for customization
 
 ## AWS S3 Setup
 
@@ -213,12 +156,9 @@ Create an IAM user/role with this policy:
         {
             "Effect": "Allow",
             "Action": [
-                "s3:PutObject",
-                "s3:GetObject",
-                "s3:ListBucket"
+                "s3:PutObject"
             ],
             "Resource": [
-                "arn:aws:s3:::your-bucket-name",
                 "arn:aws:s3:::your-bucket-name/*"
             ]
         }
@@ -236,8 +176,7 @@ Create an IAM user/role with this policy:
 ## Prerequisites
 
 - **Windows Server 2016+** (PowerShell 5.1 included)
-- **SQL Server** with Windows Authentication configured
-- **SqlServer PowerShell Module** (installer will attempt to install if missing)
+- **SQL Server Agent** creating .bak files (your existing backup process)
 - **Network access** to `s3.{region}.amazonaws.com` on port 443
 - **Valid AWS credentials** with S3 write permissions (tested during installation)
 
@@ -275,21 +214,11 @@ The installer validates S3 connectivity **before** installation. If this fails:
   - Verify internet connectivity
   - Check proxy settings if behind corporate firewall
 
-**In Silent Mode**: Installation will exit immediately if S3 test fails. Fix connectivity issues before retrying.
+### No .bak Files Found
 
-**In Interactive Mode**: You can choose to continue installation despite S3 test failure, but backups will not work until connectivity is fixed.
-
-### Backup Fails with "Access Denied"
-
-- Verify AWS credentials in config.json
-- Check S3 bucket policy allows the IAM user
-- Ensure the bucket exists in the specified region
-
-### SQL Connection Errors
-
-- Verify SQL Server is running
-- Check Windows Authentication is enabled
-- Ensure the SYSTEM account has access to the databases
+- Verify the `bak_file_path` in config.json is correct
+- Ensure SQL Agent backup job is running and creating .bak files
+- Check that the path is accessible to the SYSTEM account
 
 ### Scheduled Task Not Running
 
@@ -297,25 +226,24 @@ The installer validates S3 connectivity **before** installation. If this fails:
 - Verify the task is running as SYSTEM
 - Check logs in `C:\SarovarBackup\logs\`
 
-### Large Tables Timeout
+### Large Files Taking Long Time
 
-For tables with millions of rows, consider:
-- Increasing `-QueryTimeout` in the script
-- Backing up during low-usage periods
-- Using SQL Server's native backup for very large databases
+For very large .bak files (multiple GB), uploads may take time. The script will:
+- Show progress in logs
+- Retry up to 3 times on failure
+- Use exponential backoff between retries
 
 ## Logs
 
 Logs are stored in `C:\SarovarBackup\logs\`:
-- `backup-2026-01-16.log` - Daily backup logs
+- `backup-2026-01-29.log` - Daily backup logs
 - Automatic cleanup based on `log_retention_days`
 
 ## Security Notes
 
 1. **Config file is ACL-protected** - Only Administrators and SYSTEM can read
 2. **AWS credentials are stored locally** - Consider using AWS IAM roles if running on EC2
-3. **Windows Authentication** - No SQL passwords stored in config
-4. **HTTPS only** - All S3 communication uses TLS
+3. **HTTPS only** - All S3 communication uses TLS
 
 ## License
 

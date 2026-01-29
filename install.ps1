@@ -1,51 +1,44 @@
 <#
 .SYNOPSIS
-    Installer for MSSQL to S3 Backup Solution
+    Installer for SQL Server BAK File to S3 Backup Solution
 .DESCRIPTION
-    One-command installer that sets up the backup script, configuration,
-    and Windows Task Scheduler job for automated daily backups.
+    Sets up automated upload of SQL Server .bak files to S3.
+    The SQL Agent creates .bak files, and this solution uploads the latest one to S3.
 .PARAMETER Silent
-    Run in silent mode without prompts (requires all parameters or ConfigFile)
-.PARAMETER ConfigFile
-    Path to an existing config.json file to use instead of prompting
+    Run in silent mode without prompts (requires all parameters)
 .PARAMETER S3Bucket
     S3 bucket name
 .PARAMETER S3Region
     AWS region (default: us-east-1)
-.PARAMETER Databases
-    Comma-separated list of database names to backup
-.PARAMETER SqlServer
-    SQL Server instance name (default: localhost)
 .PARAMETER AwsAccessKey
     AWS Access Key ID
 .PARAMETER AwsSecretKey
     AWS Secret Access Key
+.PARAMETER BakFilePath
+    Path to directory where SQL Agent creates .bak files
 .PARAMETER BackupTime
     Time for daily backup in HH:mm format (default: 02:00)
 .PARAMETER InstallPath
     Installation directory (default: C:\SarovarBackup)
 .PARAMETER ServerIdentifier
     Unique server identifier (default: hostname)
+.PARAMETER S3Prefix
+    S3 prefix/folder for uploads (default: backups)
 .EXAMPLE
     # Interactive installation
     .\install.ps1
 .EXAMPLE
     # Silent installation with parameters
-    .\install.ps1 -Silent -S3Bucket "my-bucket" -Databases "DB1,DB2" -AwsAccessKey "AKIA..." -AwsSecretKey "xxx"
-.EXAMPLE
-    # Silent installation with config file
-    .\install.ps1 -Silent -ConfigFile "\\server\share\config.json"
+    .\install.ps1 -Silent -S3Bucket "my-bucket" -BakFilePath "D:\Backups" -AwsAccessKey "AKIA..." -AwsSecretKey "xxx"
 #>
 
 param(
     [switch]$Silent,
-    [string]$ConfigFile,
     [string]$S3Bucket,
     [string]$S3Region = "us-east-1",
-    [string]$Databases,
-    [string]$SqlServer = "localhost",
     [string]$AwsAccessKey,
     [string]$AwsSecretKey,
+    [string]$BakFilePath,
     [string]$BackupTime = "02:00",
     [string]$InstallPath = "C:\SarovarBackup",
     [string]$ServerIdentifier = $env:COMPUTERNAME,
@@ -77,57 +70,21 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Test-SqlServerModule {
-    try {
-        $module = Get-Module -ListAvailable -Name SqlServer
-        if ($module) {
-            return $true
-        }
-        
-        # Try SQLPS as fallback
-        $sqlps = Get-Module -ListAvailable -Name SQLPS
-        if ($sqlps) {
-            return $true
-        }
-        
-        return $false
-    }
-    catch {
-        return $false
-    }
-}
-
-function Install-SqlServerModule {
-    Write-Status "Installing SqlServer PowerShell module..." "Info"
-    try {
-        # Try to install from PSGallery
-        Install-Module -Name SqlServer -Force -AllowClobber -Scope AllUsers -ErrorAction Stop
-        Write-Status "SqlServer module installed successfully" "Success"
-        return $true
-    }
-    catch {
-        Write-Status "Could not auto-install SqlServer module: $_" "Warning"
-        Write-Status "Please install manually: Install-Module -Name SqlServer" "Warning"
-        return $false
-    }
-}
-
-function Test-SqlConnection {
-    param(
-        [string]$ServerInstance,
-        [string]$Database = "master"
-    )
+function Read-SecureInput {
+    param([string]$Prompt)
     
+    Write-Host "$Prompt" -NoNewline
+    $secureString = Read-Host -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureString)
     try {
-        Import-Module SqlServer -ErrorAction SilentlyContinue
-        $query = "SELECT 1 AS Test"
-        Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Query $query -ConnectionTimeout 10 | Out-Null
-        return $true
+        return [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
     }
-    catch {
-        return $false
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     }
 }
+
+#endregion
 
 #region ==================== AWS SIGNATURE V4 HELPERS ====================
 
@@ -255,6 +212,8 @@ function Get-AWSSignatureV4 {
 
 #endregion
 
+#region ==================== S3 CONNECTIVITY TEST ====================
+
 function Test-S3Connectivity {
     param(
         [string]$BucketName,
@@ -265,12 +224,12 @@ function Test-S3Connectivity {
     )
     
     try {
-        Write-Status "Testing S3 connectivity and write permissions..." "Info"
+        Write-Status "Testing S3 connectivity (firewall and credentials check)..." "Info"
         
         # Create test file
-        $testKey = "$S3Prefix/_install_test_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
-        $testContent = "Installation connectivity test - $(Get-Date -Format 'o')"
-        $testFile = Join-Path $env:TEMP "_s3_test_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
+        $testKey = "$S3Prefix/_connectivity_test_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
+        $testContent = "Connectivity test from $env:COMPUTERNAME - $(Get-Date -Format 'o')"
+        $testFile = Join-Path $env:TEMP "_s3_connectivity_test.txt"
         
         Set-Content -Path $testFile -Value $testContent -Encoding UTF8
         
@@ -352,7 +311,8 @@ function Test-S3Connectivity {
             # Ignore delete errors - test file can remain in S3
         }
         
-        Write-Status "S3 connectivity test successful - bucket is accessible and writable" "Success"
+        Write-Status "S3 connectivity test PASSED - bucket is accessible and writable" "Success"
+        Write-Status "Firewall is not blocking S3 access" "Success"
         return $true
     }
     catch {
@@ -362,7 +322,7 @@ function Test-S3Connectivity {
             $errorMessage = "HTTP $statusCode : $errorMessage"
         }
         
-        Write-Status "S3 connectivity test failed: $errorMessage" "Error"
+        Write-Status "S3 connectivity test FAILED: $errorMessage" "Error"
         
         # Provide helpful error messages
         if ($errorMessage -like "*403*" -or $errorMessage -like "*Forbidden*") {
@@ -374,25 +334,12 @@ function Test-S3Connectivity {
         elseif ($errorMessage -like "*401*" -or $errorMessage -like "*Unauthorized*") {
             Write-Status "Authentication failed - verify AWS Access Key and Secret Key" "Error"
         }
-        elseif ($errorMessage -like "*timeout*" -or $errorMessage -like "*network*") {
-            Write-Status "Network error - check internet connectivity and firewall settings" "Error"
+        elseif ($errorMessage -like "*timeout*" -or $errorMessage -like "*network*" -or $errorMessage -like "*Unable to connect*") {
+            Write-Status "Network/Firewall error - S3 access may be blocked by firewall" "Error"
+            Write-Status "Please ensure outbound HTTPS (port 443) to s3.$Region.amazonaws.com is allowed" "Error"
         }
         
         return $false
-    }
-}
-
-function Read-SecureInput {
-    param([string]$Prompt)
-    
-    Write-Host "$Prompt" -NoNewline
-    $secureString = Read-Host -AsSecureString
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureString)
-    try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-    }
-    finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     }
 }
 
@@ -403,7 +350,7 @@ function Read-SecureInput {
 function Main {
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "  MSSQL to S3 Backup - Installer" -ForegroundColor Cyan
+    Write-Host "  SQL BAK File to S3 - Installer" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
     
@@ -423,59 +370,27 @@ function Main {
     }
     Write-Status "PowerShell version: $psVersion" "Success"
     
-    # Check/Install SqlServer module
-    if (-not (Test-SqlServerModule)) {
-        Write-Status "SqlServer PowerShell module not found" "Warning"
-        if (-not $Silent) {
-            $installModule = Read-Host "Would you like to install it? (Y/n)"
-            if ($installModule -ne 'n') {
-                Install-SqlServerModule
-            }
-        }
-        else {
-            Install-SqlServerModule
-        }
-    }
-    else {
-        Write-Status "SqlServer PowerShell module found" "Success"
-    }
-    
-    # Import module
-    try {
-        Import-Module SqlServer -ErrorAction SilentlyContinue
-    }
-    catch {
-        Import-Module SQLPS -DisableNameChecking -ErrorAction SilentlyContinue
-    }
-    
     # Configuration
     $config = $null
     
-    if ($ConfigFile -and (Test-Path $ConfigFile)) {
-        # Load from config file
-        Write-Status "Loading configuration from: $ConfigFile" "Info"
-        $config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
-    }
-    elseif ($Silent) {
+    if ($Silent) {
         # Build config from parameters
         if ([string]::IsNullOrEmpty($S3Bucket) -or 
-            [string]::IsNullOrEmpty($Databases) -or 
+            [string]::IsNullOrEmpty($BakFilePath) -or 
             [string]::IsNullOrEmpty($AwsAccessKey) -or 
             [string]::IsNullOrEmpty($AwsSecretKey)) {
-            Write-Status "Silent mode requires: S3Bucket, Databases, AwsAccessKey, AwsSecretKey" "Error"
+            Write-Status "Silent mode requires: S3Bucket, BakFilePath, AwsAccessKey, AwsSecretKey" "Error"
             exit 1
         }
         
         $config = @{
             server_identifier = $ServerIdentifier
-            sql_server = $SqlServer
-            databases = $Databases -split ','
+            bak_file_path = $BakFilePath
             s3_bucket = $S3Bucket
             s3_region = $S3Region
             s3_prefix = $S3Prefix
             aws_access_key = $AwsAccessKey
             aws_secret_key = $AwsSecretKey
-            temp_directory = Join-Path $InstallPath "temp"
             log_directory = Join-Path $InstallPath "logs"
             log_retention_days = 30
             backup_time = $BackupTime
@@ -484,34 +399,8 @@ function Main {
     else {
         # Interactive mode
         Write-Host ""
-        Write-Host "--- Configuration ---" -ForegroundColor Yellow
+        Write-Host "--- Step 1: S3 Credentials ---" -ForegroundColor Yellow
         Write-Host ""
-        
-        # Server identifier
-        $inputServerIdentifier = Read-Host "Server identifier [$ServerIdentifier]"
-        if ([string]::IsNullOrWhiteSpace($inputServerIdentifier)) { $inputServerIdentifier = $ServerIdentifier }
-        
-        # SQL Server
-        $inputSqlServer = Read-Host "SQL Server instance [$SqlServer]"
-        if ([string]::IsNullOrWhiteSpace($inputSqlServer)) { $inputSqlServer = $SqlServer }
-        
-        # Test SQL connection
-        Write-Status "Testing SQL Server connection..." "Info"
-        if (Test-SqlConnection -ServerInstance $inputSqlServer) {
-            Write-Status "SQL Server connection successful" "Success"
-        }
-        else {
-            Write-Status "Could not connect to SQL Server: $inputSqlServer" "Warning"
-            $continue = Read-Host "Continue anyway? (y/N)"
-            if ($continue -ne 'y') { exit 1 }
-        }
-        
-        # Databases
-        $inputDatabases = Read-Host "Database names (comma-separated)"
-        if ([string]::IsNullOrWhiteSpace($inputDatabases)) {
-            Write-Status "At least one database name is required" "Error"
-            exit 1
-        }
         
         # S3 configuration
         $inputS3Bucket = Read-Host "S3 bucket name"
@@ -539,9 +428,72 @@ function Main {
             exit 1
         }
         
+        # Test S3 connectivity BEFORE proceeding
+        Write-Host ""
+        Write-Host "--- Step 2: Testing S3 Connectivity ---" -ForegroundColor Yellow
+        Write-Host ""
+        
+        $s3TestResult = Test-S3Connectivity `
+            -BucketName $inputS3Bucket `
+            -AccessKey $inputAwsAccessKey `
+            -SecretKey $inputAwsSecretKey `
+            -Region $inputS3Region `
+            -S3Prefix $inputS3Prefix
+        
+        if (-not $s3TestResult) {
+            Write-Status "S3 connectivity test failed" "Error"
+            Write-Status "Cannot proceed with installation without S3 access" "Error"
+            Write-Status "Please check your credentials and firewall settings" "Error"
+            exit 1
+        }
+        
+        Write-Host ""
+        Write-Host "--- Step 3: BAK File Location ---" -ForegroundColor Yellow
+        Write-Host ""
+        
+        # BAK file path
+        $inputBakFilePath = Read-Host "Path where SQL Agent creates .bak files (e.g., D:\SQLBackups)"
+        if ([string]::IsNullOrWhiteSpace($inputBakFilePath)) {
+            Write-Status "BAK file path is required" "Error"
+            exit 1
+        }
+        
+        # Validate the path exists
+        if (-not (Test-Path $inputBakFilePath)) {
+            Write-Status "Path does not exist: $inputBakFilePath" "Warning"
+            $createPath = Read-Host "Continue anyway? (y/N)"
+            if ($createPath -ne 'y') {
+                exit 1
+            }
+        }
+        else {
+            # Check if there are any .bak files in the path
+            $bakFiles = Get-ChildItem -Path $inputBakFilePath -Filter "*.bak" -ErrorAction SilentlyContinue
+            if ($bakFiles) {
+                Write-Status "Found $($bakFiles.Count) .bak file(s) in the specified path" "Success"
+            }
+            else {
+                Write-Status "No .bak files found in the specified path (this is OK if backups haven't run yet)" "Warning"
+            }
+        }
+        
+        Write-Host ""
+        Write-Host "--- Step 4: Schedule Configuration ---" -ForegroundColor Yellow
+        Write-Host ""
+        
+        # Server identifier
+        $inputServerIdentifier = Read-Host "Server identifier [$ServerIdentifier]"
+        if ([string]::IsNullOrWhiteSpace($inputServerIdentifier)) { $inputServerIdentifier = $ServerIdentifier }
+        
         # Backup time
-        $inputBackupTime = Read-Host "Daily backup time (HH:mm) [$BackupTime]"
+        $inputBackupTime = Read-Host "Daily upload time (HH:mm) [$BackupTime]"
         if ([string]::IsNullOrWhiteSpace($inputBackupTime)) { $inputBackupTime = $BackupTime }
+        
+        # Validate time format
+        if ($inputBackupTime -notmatch '^\d{1,2}:\d{2}$') {
+            Write-Status "Invalid time format. Please use HH:mm format (e.g., 02:00)" "Error"
+            exit 1
+        }
         
         # Install path
         $inputInstallPath = Read-Host "Installation directory [$InstallPath]"
@@ -549,14 +501,12 @@ function Main {
         
         $config = @{
             server_identifier = $inputServerIdentifier
-            sql_server = $inputSqlServer
-            databases = $inputDatabases -split ',' | ForEach-Object { $_.Trim() }
+            bak_file_path = $inputBakFilePath
             s3_bucket = $inputS3Bucket
             s3_region = $inputS3Region
             s3_prefix = $inputS3Prefix
             aws_access_key = $inputAwsAccessKey
             aws_secret_key = $inputAwsSecretKey
-            temp_directory = Join-Path $inputInstallPath "temp"
             log_directory = Join-Path $inputInstallPath "logs"
             log_retention_days = 30
             backup_time = $inputBackupTime
@@ -565,33 +515,23 @@ function Main {
         $InstallPath = $inputInstallPath
     }
     
-    # Test S3 connectivity BEFORE installation
-    Write-Host ""
-    Write-Host "--- Testing S3 Connectivity ---" -ForegroundColor Yellow
-    Write-Host ""
-    
-    $s3TestResult = Test-S3Connectivity `
-        -BucketName $config.s3_bucket `
-        -AccessKey $config.aws_access_key `
-        -SecretKey $config.aws_secret_key `
-        -Region $config.s3_region `
-        -S3Prefix $config.s3_prefix
-    
-    if (-not $s3TestResult) {
-        Write-Status "S3 connectivity test failed" "Error"
-        Write-Status "Cannot proceed with installation without S3 access" "Error"
+    # For silent mode, test S3 connectivity
+    if ($Silent) {
+        Write-Host ""
+        Write-Host "--- Testing S3 Connectivity ---" -ForegroundColor Yellow
+        Write-Host ""
         
-        if ($Silent) {
+        $s3TestResult = Test-S3Connectivity `
+            -BucketName $config.s3_bucket `
+            -AccessKey $config.aws_access_key `
+            -SecretKey $config.aws_secret_key `
+            -Region $config.s3_region `
+            -S3Prefix $config.s3_prefix
+        
+        if (-not $s3TestResult) {
+            Write-Status "S3 connectivity test failed" "Error"
             Write-Status "Silent mode: Exiting due to S3 connectivity failure" "Error"
             exit 1
-        }
-        else {
-            $continue = Read-Host "Continue with installation anyway? (y/N)"
-            if ($continue -ne 'y') {
-                Write-Status "Installation cancelled by user" "Warning"
-                exit 1
-            }
-            Write-Status "Proceeding with installation despite S3 test failure" "Warning"
         }
     }
     
@@ -604,7 +544,6 @@ function Main {
     if (-not (Test-Path $InstallPath)) {
         New-Item -ItemType Directory -Path $InstallPath -Force | Out-Null
     }
-    New-Item -ItemType Directory -Path $config.temp_directory -Force -ErrorAction SilentlyContinue | Out-Null
     New-Item -ItemType Directory -Path $config.log_directory -Force -ErrorAction SilentlyContinue | Out-Null
     Write-Status "Directories created" "Success"
     
@@ -635,23 +574,7 @@ function Main {
     Write-Status "Saving configuration..." "Info"
     $configPath = Join-Path $InstallPath "config.json"
     
-    # Remove help comments before saving
-    $cleanConfig = @{
-        server_identifier = $config.server_identifier
-        sql_server = $config.sql_server
-        databases = $config.databases
-        s3_bucket = $config.s3_bucket
-        s3_region = $config.s3_region
-        s3_prefix = $config.s3_prefix
-        aws_access_key = $config.aws_access_key
-        aws_secret_key = $config.aws_secret_key
-        temp_directory = $config.temp_directory
-        log_directory = $config.log_directory
-        log_retention_days = $config.log_retention_days
-        backup_time = $config.backup_time
-    }
-    
-    $cleanConfig | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
+    $config | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
     Write-Status "Configuration saved to: $configPath" "Success"
     
     # Secure the config file (restrict to Administrators)
@@ -677,8 +600,8 @@ function Main {
     Write-Host "--- Creating Scheduled Task ---" -ForegroundColor Yellow
     Write-Host ""
     
-    $taskName = "SarovarBackup-DailyS3Sync"
-    $taskDescription = "Daily MSSQL database backup to S3"
+    $taskName = "SarovarBackup-BakToS3"
+    $taskDescription = "Daily SQL Server BAK file upload to S3"
     
     # Parse backup time
     $timeParts = $config.backup_time -split ':'
@@ -723,7 +646,7 @@ function Main {
         -Description $taskDescription | Out-Null
     
     Write-Status "Scheduled task created successfully" "Success"
-    Write-Status "Backup will run daily at $($config.backup_time)" "Info"
+    Write-Status "BAK file upload will run daily at $($config.backup_time)" "Info"
     
     # Summary
     Write-Host ""
@@ -734,14 +657,12 @@ function Main {
     Write-Host "Installation directory: $InstallPath" -ForegroundColor White
     Write-Host "Configuration file: $configPath" -ForegroundColor White
     Write-Host "Log directory: $($config.log_directory)" -ForegroundColor White
+    Write-Host "BAK file source: $($config.bak_file_path)" -ForegroundColor White
     Write-Host "Scheduled task: $taskName" -ForegroundColor White
-    Write-Host "Daily backup time: $($config.backup_time)" -ForegroundColor White
+    Write-Host "Daily upload time: $($config.backup_time)" -ForegroundColor White
     Write-Host ""
     Write-Host "To run a backup manually:" -ForegroundColor Yellow
     Write-Host "  & `"$destScript`" -ConfigPath `"$configPath`"" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "To test connection only:" -ForegroundColor Yellow
-    Write-Host "  & `"$destScript`" -ConfigPath `"$configPath`" -TestOnly" -ForegroundColor Gray
     Write-Host ""
     Write-Host "To uninstall:" -ForegroundColor Yellow
     Write-Host "  & `"$destUninstall`"" -ForegroundColor Gray

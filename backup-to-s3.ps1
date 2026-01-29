@@ -1,18 +1,17 @@
 <#
 .SYNOPSIS
-    MSSQL Database Backup to S3 - Pure PowerShell Implementation
+    SQL Server BAK File Upload to S3 - Pure PowerShell Implementation
 .DESCRIPTION
-    Exports all tables from specified MSSQL databases to CSV and uploads to S3
+    Finds the latest .bak file from the configured directory and uploads it to S3
     using native PowerShell REST API calls (no AWS CLI required).
 .NOTES
-    Version: 1.0.0
-    Requires: PowerShell 5.1+, SqlServer module
+    Version: 2.0.0
+    Requires: PowerShell 5.1+
 #>
 
 param(
     [string]$ConfigPath = "$PSScriptRoot\config.json",
-    [switch]$TestOnly,
-    [switch]$Verbose
+    [switch]$TestOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -200,7 +199,7 @@ function Get-AWSSignatureV4 {
 
 #region ==================== S3 OPERATIONS ====================
 
-function Send-S3Object {
+function Send-FileToS3 {
     param(
         [string]$BucketName,
         [string]$Key,
@@ -212,7 +211,9 @@ function Send-S3Object {
     )
     
     $fileInfo = Get-Item $FilePath
-    $contentType = "text/csv"
+    $contentType = "application/octet-stream"
+    
+    Write-Log "Calculating file hash for: $($fileInfo.Name) ($([math]::Round($fileInfo.Length / 1MB, 2)) MB)" "INFO"
     
     # Calculate payload hash from file
     $payloadHash = Get-SHA256HashFromFile -FilePath $FilePath
@@ -248,6 +249,8 @@ function Send-S3Object {
     
     while (-not $success -and $retryCount -lt $MaxRetries) {
         try {
+            Write-Log "Uploading to S3: $Key (Attempt $($retryCount + 1)/$MaxRetries)" "INFO"
+            
             $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
             
             $response = Invoke-RestMethod `
@@ -258,13 +261,13 @@ function Send-S3Object {
                 -ContentType $contentType
             
             $success = $true
-            Write-Log "Uploaded: $Key ($([math]::Round($fileInfo.Length / 1KB, 2)) KB)" "SUCCESS"
+            Write-Log "Upload successful: $Key ($([math]::Round($fileInfo.Length / 1MB, 2)) MB)" "SUCCESS"
         }
         catch {
             $retryCount++
             if ($retryCount -lt $MaxRetries) {
                 $waitTime = [math]::Pow(2, $retryCount)
-                Write-Log "Upload failed, retrying in $waitTime seconds... (Attempt $retryCount/$MaxRetries)" "WARN"
+                Write-Log "Upload failed, retrying in $waitTime seconds... (Attempt $retryCount/$MaxRetries): $_" "WARN"
                 Start-Sleep -Seconds $waitTime
                 
                 # Recalculate signature for retry (time changes)
@@ -290,60 +293,23 @@ function Send-S3Object {
     return $success
 }
 
-function Get-S3Object {
-    param(
-        [string]$BucketName,
-        [string]$Key,
-        [string]$OutputPath,
-        [string]$AccessKey,
-        [string]$SecretKey,
-        [string]$Region
-    )
-    
-    $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$Key"
-    $payloadHash = Get-SHA256Hash -Data ([byte[]]@())
-    
-    $headers = @{
-        "Host" = "s3.$Region.amazonaws.com"
-    }
-    
-    $authResult = Get-AWSSignatureV4 `
-        -Method "GET" `
-        -Uri $endpoint `
-        -Region $Region `
-        -Service "s3" `
-        -AccessKey $AccessKey `
-        -SecretKey $SecretKey `
-        -Headers $headers `
-        -PayloadHash $payloadHash
-    
-    $requestHeaders = @{
-        "Authorization" = $authResult.Authorization
-        "x-amz-date" = $authResult.AmzDate
-        "x-amz-content-sha256" = $authResult.AmzContentSha256
-        "Host" = "s3.$Region.amazonaws.com"
-    }
-    
-    Invoke-RestMethod -Uri $endpoint -Method GET -Headers $requestHeaders -OutFile $OutputPath
-    Write-Log "Downloaded: $Key" "SUCCESS"
-}
-
 function Test-S3Connection {
     param(
         [string]$BucketName,
         [string]$AccessKey,
         [string]$SecretKey,
-        [string]$Region
+        [string]$Region,
+        [string]$S3Prefix
     )
     
     try {
-        $testKey = "_connection_test_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
+        $testKey = "$S3Prefix/_connection_test_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
         $testContent = "Connection test - $(Get-Date)"
-        $testFile = Join-Path $env:TEMP $testKey
+        $testFile = Join-Path $env:TEMP "_s3_test_$((Get-Date -Format 'yyyyMMddHHmmss')).txt"
         
-        Set-Content -Path $testFile -Value $testContent
+        Set-Content -Path $testFile -Value $testContent -Encoding UTF8
         
-        Send-S3Object `
+        Send-FileToS3 `
             -BucketName $BucketName `
             -Key $testKey `
             -FilePath $testFile `
@@ -364,133 +330,36 @@ function Test-S3Connection {
 
 #endregion
 
-#region ==================== DATABASE OPERATIONS ====================
-
-function Test-SqlConnection {
-    param(
-        [string]$ServerInstance,
-        [string]$Database
-    )
-    
-    try {
-        $query = "SELECT 1 AS ConnectionTest"
-        Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Query $query -ConnectionTimeout 10 | Out-Null
-        return $true
-    }
-    catch {
-        Write-Log "SQL connection failed to $ServerInstance/$Database : $_" "ERROR"
-        return $false
-    }
-}
-
-function Get-DatabaseTables {
-    param(
-        [string]$ServerInstance,
-        [string]$Database
-    )
-    
-    $query = @"
-        SELECT 
-            TABLE_SCHEMA,
-            TABLE_NAME
-        FROM INFORMATION_SCHEMA.TABLES 
-        WHERE TABLE_TYPE = 'BASE TABLE'
-        ORDER BY TABLE_SCHEMA, TABLE_NAME
-"@
-    
-    $tables = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Query $query
-    return $tables
-}
-
-function Get-TableRowCount {
-    param(
-        [string]$ServerInstance,
-        [string]$Database,
-        [string]$Schema,
-        [string]$TableName
-    )
-    
-    $query = "SELECT COUNT(*) AS [RowCount] FROM [$Schema].[$TableName]"
-    $result = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Query $query
-    return $result.RowCount
-}
-
-function Export-TableToCsv {
-    param(
-        [string]$ServerInstance,
-        [string]$Database,
-        [string]$Schema,
-        [string]$TableName,
-        [string]$OutputPath
-    )
-    
-    $query = "SELECT * FROM [$Schema].[$TableName]"
-    
-    try {
-        $data = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Query $query -MaxCharLength 65535
-        
-        if ($data) {
-            $data | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-            return $true
-        }
-        else {
-            # Empty table - create empty CSV with headers
-            $headerQuery = @"
-                SELECT COLUMN_NAME 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_SCHEMA = '$Schema' AND TABLE_NAME = '$TableName'
-                ORDER BY ORDINAL_POSITION
-"@
-            $columns = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Query $headerQuery
-            $headers = ($columns | ForEach-Object { "`"$($_.COLUMN_NAME)`"" }) -join ","
-            Set-Content -Path $OutputPath -Value $headers -Encoding UTF8
-            return $true
-        }
-    }
-    catch {
-        Write-Log "Failed to export $Schema.$TableName : $_" "ERROR"
-        return $false
-    }
-}
-
-function Get-TableSchema {
-    param(
-        [string]$ServerInstance,
-        [string]$Database,
-        [string]$Schema,
-        [string]$TableName
-    )
-    
-    $query = @"
-        SELECT 
-            COLUMN_NAME,
-            DATA_TYPE,
-            CHARACTER_MAXIMUM_LENGTH,
-            IS_NULLABLE,
-            COLUMN_DEFAULT
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_SCHEMA = '$Schema' AND TABLE_NAME = '$TableName'
-        ORDER BY ORDINAL_POSITION
-"@
-    
-    $columns = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $Database -Query $query
-    
-    return $columns | ForEach-Object {
-        @{
-            name = $_.COLUMN_NAME
-            type = $_.DATA_TYPE
-            max_length = $_.CHARACTER_MAXIMUM_LENGTH
-            nullable = $_.IS_NULLABLE
-            default = $_.COLUMN_DEFAULT
-        }
-    }
-}
-
-#endregion
-
 #region ==================== MAIN BACKUP LOGIC ====================
 
-function Start-DatabaseBackup {
+function Get-LatestBakFile {
+    param(
+        [string]$BakDirectory
+    )
+    
+    Write-Log "Searching for .bak files in: $BakDirectory" "INFO"
+    
+    if (-not (Test-Path $BakDirectory)) {
+        throw "BAK file directory does not exist: $BakDirectory"
+    }
+    
+    # Get the latest .bak file by LastWriteTime
+    $latestBak = Get-ChildItem -Path $BakDirectory -Filter "*.bak" -File | 
+                 Sort-Object LastWriteTime -Descending | 
+                 Select-Object -First 1
+    
+    if (-not $latestBak) {
+        throw "No .bak files found in directory: $BakDirectory"
+    }
+    
+    Write-Log "Found latest BAK file: $($latestBak.Name)" "INFO"
+    Write-Log "File size: $([math]::Round($latestBak.Length / 1MB, 2)) MB" "INFO"
+    Write-Log "Last modified: $($latestBak.LastWriteTime)" "INFO"
+    
+    return $latestBak
+}
+
+function Start-BakFileUpload {
     param(
         [object]$Config
     )
@@ -501,140 +370,38 @@ function Start-DatabaseBackup {
         $serverIdentifier = $env:COMPUTERNAME
     }
     
-    $backupSummary = @{
-        server = $serverIdentifier
-        timestamp = (Get-Date).ToString("o")
-        databases = @()
-        total_tables = 0
-        successful_uploads = 0
-        failed_uploads = 0
-    }
+    # Get the latest .bak file
+    $bakFile = Get-LatestBakFile -BakDirectory $Config.bak_file_path
     
-    foreach ($database in $Config.databases) {
-        Write-Log "Processing database: $database" "INFO"
-        
-        $dbSummary = @{
-            name = $database
-            tables = @()
-            status = "success"
-        }
-        
-        # Test connection
-        if (-not (Test-SqlConnection -ServerInstance $Config.sql_server -Database $database)) {
-            Write-Log "Skipping database $database - connection failed" "ERROR"
-            $dbSummary.status = "connection_failed"
-            $backupSummary.databases += $dbSummary
-            continue
-        }
-        
-        # Get all tables
-        $tables = Get-DatabaseTables -ServerInstance $Config.sql_server -Database $database
-        Write-Log "Found $($tables.Count) tables in $database" "INFO"
-        
-        # Create temp directory for this database
-        $dbTempDir = Join-Path $Config.temp_directory "$serverIdentifier\$database\$date"
-        if (-not (Test-Path $dbTempDir)) {
-            New-Item -ItemType Directory -Path $dbTempDir -Force | Out-Null
-        }
-        
-        foreach ($table in $tables) {
-            $schema = $table.TABLE_SCHEMA
-            $tableName = $table.TABLE_NAME
-            $fullTableName = "$schema.$tableName"
-            $csvFileName = "$schema`_$tableName.csv"
-            $csvPath = Join-Path $dbTempDir $csvFileName
-            
-            $backupSummary.total_tables++
-            
-            Write-Log "Exporting: $fullTableName" "INFO"
-            
-            $tableSummary = @{
-                schema = $schema
-                name = $tableName
-                rows = 0
-                status = "success"
-            }
-            
-            try {
-                # Get row count
-                $rowCount = Get-TableRowCount -ServerInstance $Config.sql_server -Database $database -Schema $schema -TableName $tableName
-                $tableSummary.rows = $rowCount
-                
-                # Export to CSV
-                $exportSuccess = Export-TableToCsv `
-                    -ServerInstance $Config.sql_server `
-                    -Database $database `
-                    -Schema $schema `
-                    -TableName $tableName `
-                    -OutputPath $csvPath
-                
-                if ($exportSuccess) {
-                    # Upload to S3
-                    $s3Key = "$($Config.s3_prefix)/$serverIdentifier/$database/$date/$csvFileName"
-                    
-                    Send-S3Object `
-                        -BucketName $Config.s3_bucket `
-                        -Key $s3Key `
-                        -FilePath $csvPath `
-                        -AccessKey $Config.aws_access_key `
-                        -SecretKey $Config.aws_secret_key `
-                        -Region $Config.s3_region
-                    
-                    $backupSummary.successful_uploads++
-                    
-                    # Get schema info for manifest
-                    $tableSummary.schema_info = Get-TableSchema `
-                        -ServerInstance $Config.sql_server `
-                        -Database $database `
-                        -Schema $schema `
-                        -TableName $tableName
-                }
-                else {
-                    $tableSummary.status = "export_failed"
-                    $backupSummary.failed_uploads++
-                }
-            }
-            catch {
-                Write-Log "Failed to backup $fullTableName : $_" "ERROR"
-                $tableSummary.status = "failed"
-                $tableSummary.error = $_.ToString()
-                $backupSummary.failed_uploads++
-            }
-            
-            $dbSummary.tables += $tableSummary
-        }
-        
-        $backupSummary.databases += $dbSummary
-    }
+    # Build S3 key with server identifier and date
+    $s3Key = "$($Config.s3_prefix)/$serverIdentifier/$date/$($bakFile.Name)"
     
-    # Upload manifest
-    try {
-        $manifestPath = Join-Path $Config.temp_directory "_manifest.json"
-        $backupSummary | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding UTF8
-        
-        $manifestKey = "$($Config.s3_prefix)/$serverIdentifier/_manifest_$date.json"
-        Send-S3Object `
-            -BucketName $Config.s3_bucket `
-            -Key $manifestKey `
-            -FilePath $manifestPath `
-            -AccessKey $Config.aws_access_key `
-            -SecretKey $Config.aws_secret_key `
-            -Region $Config.s3_region
-        
-        Remove-Item $manifestPath -Force -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Log "Failed to upload manifest: $_" "WARN"
-    }
+    Write-Log "Starting upload to S3..." "INFO"
+    Write-Log "S3 Bucket: $($Config.s3_bucket)" "INFO"
+    Write-Log "S3 Key: $s3Key" "INFO"
     
-    # Cleanup temp files
-    Write-Log "Cleaning up temporary files..." "INFO"
-    $tempServerDir = Join-Path $Config.temp_directory $serverIdentifier
-    if (Test-Path $tempServerDir) {
-        Remove-Item $tempServerDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    # Upload to S3
+    $uploadResult = Send-FileToS3 `
+        -BucketName $Config.s3_bucket `
+        -Key $s3Key `
+        -FilePath $bakFile.FullName `
+        -AccessKey $Config.aws_access_key `
+        -SecretKey $Config.aws_secret_key `
+        -Region $Config.s3_region
     
-    return $backupSummary
+    if ($uploadResult) {
+        Write-Log "BAK file uploaded successfully to S3" "SUCCESS"
+        return @{
+            success = $true
+            file_name = $bakFile.Name
+            file_size_mb = [math]::Round($bakFile.Length / 1MB, 2)
+            s3_key = $s3Key
+            timestamp = (Get-Date).ToString("o")
+        }
+    }
+    else {
+        throw "Failed to upload BAK file to S3"
+    }
 }
 
 #endregion
@@ -655,17 +422,12 @@ function Main {
         
         Write-Log "Configuration loaded from: $ConfigPath" "INFO"
         Write-Log "Server: $($config.server_identifier)" "INFO"
-        Write-Log "Databases: $($config.databases -join ', ')" "INFO"
+        Write-Log "BAK File Path: $($config.bak_file_path)" "INFO"
         Write-Log "S3 Bucket: $($config.s3_bucket)" "INFO"
         
         # Clean old logs
         if ($config.log_retention_days -gt 0) {
             Remove-OldLogs -LogDirectory $config.log_directory -RetentionDays $config.log_retention_days
-        }
-        
-        # Create temp directory if needed
-        if (-not (Test-Path $config.temp_directory)) {
-            New-Item -ItemType Directory -Path $config.temp_directory -Force | Out-Null
         }
         
         # Test S3 connection first
@@ -674,7 +436,8 @@ function Main {
             -BucketName $config.s3_bucket `
             -AccessKey $config.aws_access_key `
             -SecretKey $config.aws_secret_key `
-            -Region $config.s3_region
+            -Region $config.s3_region `
+            -S3Prefix $config.s3_prefix
         
         if (-not $s3Test) {
             throw "S3 connection test failed. Please verify your AWS credentials and bucket access."
@@ -682,21 +445,17 @@ function Main {
         
         if ($TestOnly) {
             Write-Log "Test mode - exiting after connection tests" "SUCCESS"
-            return
+            exit 0
         }
         
         # Start backup
-        $summary = Start-DatabaseBackup -Config $config
+        $result = Start-BakFileUpload -Config $config
         
         # Print summary
-        Write-Log "=== Backup Complete ===" "INFO"
-        Write-Log "Total tables: $($summary.total_tables)" "INFO"
-        Write-Log "Successful uploads: $($summary.successful_uploads)" "SUCCESS"
-        
-        if ($summary.failed_uploads -gt 0) {
-            Write-Log "Failed uploads: $($summary.failed_uploads)" "ERROR"
-            exit 1
-        }
+        Write-Log "=== Backup Complete ===" "SUCCESS"
+        Write-Log "File: $($result.file_name)" "INFO"
+        Write-Log "Size: $($result.file_size_mb) MB" "INFO"
+        Write-Log "S3 Location: s3://$($config.s3_bucket)/$($result.s3_key)" "INFO"
         
         exit 0
     }

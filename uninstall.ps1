@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Uninstaller for MSSQL to S3 Backup Solution
+    Uninstaller for SQL Server BAK to S3 Backup Solution
 .DESCRIPTION
     Removes the scheduled task and optionally deletes installation files.
 .PARAMETER KeepLogs
@@ -50,7 +50,7 @@ function Test-Administrator {
 function Main {
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "  MSSQL to S3 Backup - Uninstaller" -ForegroundColor Cyan
+    Write-Host "  SQL BAK to S3 - Uninstaller" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
     
@@ -64,7 +64,7 @@ function Main {
     # Confirm uninstallation
     if (-not $Silent) {
         Write-Host "This will remove:" -ForegroundColor Yellow
-        Write-Host "  - Scheduled task: SarovarBackup-DailyS3Sync" -ForegroundColor White
+        Write-Host "  - Scheduled task: SarovarBackup-BakToS3" -ForegroundColor White
         Write-Host "  - Installation directory: $InstallPath" -ForegroundColor White
         if (-not $KeepLogs) {
             Write-Host "  - Log files" -ForegroundColor White
@@ -83,7 +83,7 @@ function Main {
     Write-Host ""
     
     # Remove scheduled task
-    $taskName = "SarovarBackup-DailyS3Sync"
+    $taskName = "SarovarBackup-BakToS3"
     Write-Status "Removing scheduled task..." "Info"
     
     $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
