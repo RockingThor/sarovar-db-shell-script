@@ -5,6 +5,9 @@ Automated daily upload of SQL Server .bak backup files to Amazon S3 using pure P
 ## Features
 
 - **Zero External Dependencies**: Uses native PowerShell with direct S3 REST API calls (AWS Signature V4)
+- **Large File Support**: S3 Multipart Upload handles files up to 1TB (uploads in 100MB chunks)
+- **Memory Efficient**: Streams file chunks instead of loading entire file into RAM
+- **Progress Tracking**: Real-time upload progress with percentage and estimated time remaining
 - **Simple Installation**: One-command installer with automatic Task Scheduler setup
 - **Firewall Validation**: Tests S3 connectivity before installation to ensure network access
 - **Mass Deployment Ready**: Silent mode for deploying to multiple servers
@@ -147,7 +150,7 @@ foreach ($server in $servers) {
 
 ### Required IAM Permissions
 
-Create an IAM user/role with this policy:
+Create an IAM user/role with this policy (includes multipart upload permissions):
 
 ```json
 {
@@ -156,7 +159,8 @@ Create an IAM user/role with this policy:
         {
             "Effect": "Allow",
             "Action": [
-                "s3:PutObject"
+                "s3:PutObject",
+                "s3:AbortMultipartUpload"
             ],
             "Resource": [
                 "arn:aws:s3:::your-bucket-name/*"
@@ -226,12 +230,25 @@ The installer validates S3 connectivity **before** installation. If this fails:
 - Verify the task is running as SYSTEM
 - Check logs in `C:\SarovarBackup\logs\`
 
-### Large Files Taking Long Time
+### Large Files (20GB+)
 
-For very large .bak files (multiple GB), uploads may take time. The script will:
-- Show progress in logs
-- Retry up to 3 times on failure
-- Use exponential backoff between retries
+The script uses S3 Multipart Upload for efficient handling of large files:
+- Files are uploaded in 100MB chunks (memory efficient)
+- Progress is shown for each chunk with estimated time remaining
+- Each chunk retries up to 3 times on failure with exponential backoff
+- If upload fails, incomplete parts are automatically cleaned up from S3
+- Supports files up to 1TB
+
+Example log output for a 20GB file:
+```
+[INFO] Starting upload: database_full.bak
+[INFO] File size: 20480.00 MB (20.0 GB)
+[INFO] Upload will be split into 205 parts (100 MB each)
+[INFO] Uploading part 1 of 205 (0.5%) - ETA: 45m 30s
+[INFO] Uploading part 50 of 205 (24.4%) - ETA: 34m 15s
+...
+[SUCCESS] Upload complete: 20.0 GB in 42m 15s (avg: 8.09 MB/s)
+```
 
 ## Logs
 

@@ -3,10 +3,11 @@
     SQL Server BAK File Upload to S3 - Pure PowerShell Implementation
 .DESCRIPTION
     Finds the latest .bak file from the configured directory and uploads it to S3
-    using native PowerShell REST API calls (no AWS CLI required).
+    using S3 Multipart Upload API for large file support (no AWS CLI required).
 .NOTES
-    Version: 2.0.0
+    Version: 3.0.0
     Requires: PowerShell 5.1+
+    Supports files up to 1TB using multipart upload
 #>
 
 param(
@@ -16,6 +17,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:LogFile = $null
+
+# Multipart upload configuration
+$script:PartSizeMB = 100  # 100MB per part
+$script:PartSizeBytes = $script:PartSizeMB * 1MB
+$script:MaxRetries = 3
 
 #region ==================== LOGGING ====================
 
@@ -79,20 +85,6 @@ function Get-SHA256Hash {
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     $hash = $sha256.ComputeHash($Data)
     return [BitConverter]::ToString($hash).Replace("-", "").ToLower()
-}
-
-function Get-SHA256HashFromFile {
-    param([string]$FilePath)
-    
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    $stream = [System.IO.File]::OpenRead($FilePath)
-    try {
-        $hash = $sha256.ComputeHash($stream)
-        return [BitConverter]::ToString($hash).Replace("-", "").ToLower()
-    }
-    finally {
-        $stream.Close()
-    }
 }
 
 function Get-HMACSHA256 {
@@ -197,7 +189,252 @@ function Get-AWSSignatureV4 {
 
 #endregion
 
-#region ==================== S3 OPERATIONS ====================
+#region ==================== S3 MULTIPART UPLOAD ====================
+
+function Start-S3MultipartUpload {
+    param(
+        [string]$BucketName,
+        [string]$Key,
+        [string]$AccessKey,
+        [string]$SecretKey,
+        [string]$Region
+    )
+    
+    Write-Log "Initiating multipart upload for: $Key" "INFO"
+    
+    $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$Key"
+    $queryString = "uploads="
+    
+    $payloadHash = Get-SHA256Hash -Data ([byte[]]@())
+    
+    $headers = @{
+        "Host" = "s3.$Region.amazonaws.com"
+        "Content-Type" = "application/octet-stream"
+    }
+    
+    $authResult = Get-AWSSignatureV4 `
+        -Method "POST" `
+        -Uri $endpoint `
+        -Region $Region `
+        -Service "s3" `
+        -AccessKey $AccessKey `
+        -SecretKey $SecretKey `
+        -Headers $headers `
+        -PayloadHash $payloadHash `
+        -QueryString $queryString
+    
+    $requestHeaders = @{
+        "Authorization" = $authResult.Authorization
+        "x-amz-date" = $authResult.AmzDate
+        "x-amz-content-sha256" = $authResult.AmzContentSha256
+        "Content-Type" = "application/octet-stream"
+        "Host" = "s3.$Region.amazonaws.com"
+    }
+    
+    $response = Invoke-RestMethod `
+        -Uri "$endpoint`?uploads" `
+        -Method POST `
+        -Headers $requestHeaders
+    
+    $uploadId = $response.InitiateMultipartUploadResult.UploadId
+    Write-Log "Multipart upload initiated. UploadId: $uploadId" "INFO"
+    
+    return $uploadId
+}
+
+function Send-S3Part {
+    param(
+        [string]$BucketName,
+        [string]$Key,
+        [string]$UploadId,
+        [int]$PartNumber,
+        [byte[]]$Data,
+        [string]$AccessKey,
+        [string]$SecretKey,
+        [string]$Region,
+        [int]$MaxRetries = 3
+    )
+    
+    $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$Key"
+    $queryString = "partNumber=$PartNumber&uploadId=$UploadId"
+    
+    # Calculate hash for this chunk
+    $payloadHash = Get-SHA256Hash -Data $Data
+    
+    $headers = @{
+        "Host" = "s3.$Region.amazonaws.com"
+        "Content-Type" = "application/octet-stream"
+    }
+    
+    $retryCount = 0
+    $etag = $null
+    
+    while (-not $etag -and $retryCount -lt $MaxRetries) {
+        try {
+            $authResult = Get-AWSSignatureV4 `
+                -Method "PUT" `
+                -Uri $endpoint `
+                -Region $Region `
+                -Service "s3" `
+                -AccessKey $AccessKey `
+                -SecretKey $SecretKey `
+                -Headers $headers `
+                -PayloadHash $payloadHash `
+                -QueryString $queryString
+            
+            $requestHeaders = @{
+                "Authorization" = $authResult.Authorization
+                "x-amz-date" = $authResult.AmzDate
+                "x-amz-content-sha256" = $authResult.AmzContentSha256
+                "Content-Type" = "application/octet-stream"
+                "Host" = "s3.$Region.amazonaws.com"
+            }
+            
+            $response = Invoke-WebRequest `
+                -Uri "$endpoint`?partNumber=$PartNumber&uploadId=$UploadId" `
+                -Method PUT `
+                -Headers $requestHeaders `
+                -Body $Data `
+                -ContentType "application/octet-stream" `
+                -UseBasicParsing
+            
+            # Extract ETag from response headers
+            $etag = $response.Headers["ETag"]
+            if ($etag) {
+                $etag = $etag.Trim('"')
+            }
+        }
+        catch {
+            $retryCount++
+            if ($retryCount -lt $MaxRetries) {
+                $waitTime = [math]::Pow(2, $retryCount)
+                Write-Log "Part $PartNumber upload failed, retrying in $waitTime seconds... (Attempt $retryCount/$MaxRetries)" "WARN"
+                Start-Sleep -Seconds $waitTime
+            }
+            else {
+                throw "Failed to upload part $PartNumber after $MaxRetries attempts: $_"
+            }
+        }
+    }
+    
+    return $etag
+}
+
+function Complete-S3MultipartUpload {
+    param(
+        [string]$BucketName,
+        [string]$Key,
+        [string]$UploadId,
+        [array]$Parts,
+        [string]$AccessKey,
+        [string]$SecretKey,
+        [string]$Region
+    )
+    
+    Write-Log "Completing multipart upload with $($Parts.Count) parts..." "INFO"
+    
+    $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$Key"
+    $queryString = "uploadId=$UploadId"
+    
+    # Build the completion XML
+    $xmlParts = $Parts | ForEach-Object {
+        "<Part><PartNumber>$($_.PartNumber)</PartNumber><ETag>`"$($_.ETag)`"</ETag></Part>"
+    }
+    $completionXml = "<CompleteMultipartUpload>$($xmlParts -join '')</CompleteMultipartUpload>"
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($completionXml)
+    
+    $payloadHash = Get-SHA256Hash -Data $bodyBytes
+    
+    $headers = @{
+        "Host" = "s3.$Region.amazonaws.com"
+        "Content-Type" = "application/xml"
+    }
+    
+    $authResult = Get-AWSSignatureV4 `
+        -Method "POST" `
+        -Uri $endpoint `
+        -Region $Region `
+        -Service "s3" `
+        -AccessKey $AccessKey `
+        -SecretKey $SecretKey `
+        -Headers $headers `
+        -PayloadHash $payloadHash `
+        -QueryString $queryString
+    
+    $requestHeaders = @{
+        "Authorization" = $authResult.Authorization
+        "x-amz-date" = $authResult.AmzDate
+        "x-amz-content-sha256" = $authResult.AmzContentSha256
+        "Content-Type" = "application/xml"
+        "Host" = "s3.$Region.amazonaws.com"
+    }
+    
+    $response = Invoke-RestMethod `
+        -Uri "$endpoint`?uploadId=$UploadId" `
+        -Method POST `
+        -Headers $requestHeaders `
+        -Body $completionXml `
+        -ContentType "application/xml"
+    
+    Write-Log "Multipart upload completed successfully" "SUCCESS"
+    return $response
+}
+
+function Stop-S3MultipartUpload {
+    param(
+        [string]$BucketName,
+        [string]$Key,
+        [string]$UploadId,
+        [string]$AccessKey,
+        [string]$SecretKey,
+        [string]$Region
+    )
+    
+    Write-Log "Aborting multipart upload: $UploadId" "WARN"
+    
+    $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$Key"
+    $queryString = "uploadId=$UploadId"
+    
+    $payloadHash = Get-SHA256Hash -Data ([byte[]]@())
+    
+    $headers = @{
+        "Host" = "s3.$Region.amazonaws.com"
+    }
+    
+    $authResult = Get-AWSSignatureV4 `
+        -Method "DELETE" `
+        -Uri $endpoint `
+        -Region $Region `
+        -Service "s3" `
+        -AccessKey $AccessKey `
+        -SecretKey $SecretKey `
+        -Headers $headers `
+        -PayloadHash $payloadHash `
+        -QueryString $queryString
+    
+    $requestHeaders = @{
+        "Authorization" = $authResult.Authorization
+        "x-amz-date" = $authResult.AmzDate
+        "x-amz-content-sha256" = $authResult.AmzContentSha256
+        "Host" = "s3.$Region.amazonaws.com"
+    }
+    
+    try {
+        Invoke-RestMethod `
+            -Uri "$endpoint`?uploadId=$UploadId" `
+            -Method DELETE `
+            -Headers $requestHeaders | Out-Null
+        
+        Write-Log "Multipart upload aborted successfully" "INFO"
+    }
+    catch {
+        Write-Log "Failed to abort multipart upload: $_" "WARN"
+    }
+}
+
+#endregion
+
+#region ==================== S3 FILE UPLOAD ====================
 
 function Send-FileToS3 {
     param(
@@ -206,91 +443,136 @@ function Send-FileToS3 {
         [string]$FilePath,
         [string]$AccessKey,
         [string]$SecretKey,
-        [string]$Region,
-        [int]$MaxRetries = 3
+        [string]$Region
     )
     
     $fileInfo = Get-Item $FilePath
-    $contentType = "application/octet-stream"
+    $fileSizeBytes = $fileInfo.Length
+    $fileSizeMB = [math]::Round($fileSizeBytes / 1MB, 2)
+    $fileSizeGB = [math]::Round($fileSizeBytes / 1GB, 2)
     
-    Write-Log "Calculating file hash for: $($fileInfo.Name) ($([math]::Round($fileInfo.Length / 1MB, 2)) MB)" "INFO"
+    Write-Log "Starting upload: $($fileInfo.Name)" "INFO"
+    Write-Log "File size: $fileSizeMB MB ($fileSizeGB GB)" "INFO"
     
-    # Calculate payload hash from file
-    $payloadHash = Get-SHA256HashFromFile -FilePath $FilePath
+    # Calculate total parts
+    $totalParts = [math]::Ceiling($fileSizeBytes / $script:PartSizeBytes)
+    Write-Log "Upload will be split into $totalParts parts ($script:PartSizeMB MB each)" "INFO"
     
-    # Build endpoint URL (path-style for compatibility)
-    $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$Key"
+    $uploadId = $null
+    $startTime = Get-Date
     
-    $headers = @{
-        "Host" = "s3.$Region.amazonaws.com"
-        "Content-Type" = $contentType
-    }
-    
-    $authResult = Get-AWSSignatureV4 `
-        -Method "PUT" `
-        -Uri $endpoint `
-        -Region $Region `
-        -Service "s3" `
-        -AccessKey $AccessKey `
-        -SecretKey $SecretKey `
-        -Headers $headers `
-        -PayloadHash $payloadHash
-    
-    $requestHeaders = @{
-        "Authorization" = $authResult.Authorization
-        "x-amz-date" = $authResult.AmzDate
-        "x-amz-content-sha256" = $authResult.AmzContentSha256
-        "Content-Type" = $contentType
-        "Host" = "s3.$Region.amazonaws.com"
-    }
-    
-    $retryCount = 0
-    $success = $false
-    
-    while (-not $success -and $retryCount -lt $MaxRetries) {
+    try {
+        # Step 1: Initiate multipart upload
+        $uploadId = Start-S3MultipartUpload `
+            -BucketName $BucketName `
+            -Key $Key `
+            -AccessKey $AccessKey `
+            -SecretKey $SecretKey `
+            -Region $Region
+        
+        # Step 2: Upload parts
+        $parts = @()
+        $partNumber = 1
+        $bytesUploaded = 0
+        
+        $stream = [System.IO.File]::OpenRead($FilePath)
+        $buffer = New-Object byte[] $script:PartSizeBytes
+        
         try {
-            Write-Log "Uploading to S3: $Key (Attempt $($retryCount + 1)/$MaxRetries)" "INFO"
-            
-            $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
-            
-            $response = Invoke-RestMethod `
-                -Uri $endpoint `
-                -Method PUT `
-                -Headers $requestHeaders `
-                -Body $fileBytes `
-                -ContentType $contentType
-            
-            $success = $true
-            Write-Log "Upload successful: $Key ($([math]::Round($fileInfo.Length / 1MB, 2)) MB)" "SUCCESS"
-        }
-        catch {
-            $retryCount++
-            if ($retryCount -lt $MaxRetries) {
-                $waitTime = [math]::Pow(2, $retryCount)
-                Write-Log "Upload failed, retrying in $waitTime seconds... (Attempt $retryCount/$MaxRetries): $_" "WARN"
-                Start-Sleep -Seconds $waitTime
+            while (($bytesRead = $stream.Read($buffer, 0, $script:PartSizeBytes)) -gt 0) {
+                # Get the actual chunk data
+                $chunk = if ($bytesRead -eq $script:PartSizeBytes) {
+                    $buffer
+                } else {
+                    $buffer[0..($bytesRead - 1)]
+                }
                 
-                # Recalculate signature for retry (time changes)
-                $authResult = Get-AWSSignatureV4 `
-                    -Method "PUT" `
-                    -Uri $endpoint `
-                    -Region $Region `
-                    -Service "s3" `
+                # Calculate progress
+                $percentComplete = [math]::Round(($partNumber / $totalParts) * 100, 1)
+                $bytesUploaded += $bytesRead
+                
+                # Calculate estimated time remaining
+                $elapsed = (Get-Date) - $startTime
+                $bytesPerSecond = if ($elapsed.TotalSeconds -gt 0) { $bytesUploaded / $elapsed.TotalSeconds } else { 0 }
+                $bytesRemaining = $fileSizeBytes - $bytesUploaded
+                $secondsRemaining = if ($bytesPerSecond -gt 0) { $bytesRemaining / $bytesPerSecond } else { 0 }
+                $timeRemaining = [TimeSpan]::FromSeconds($secondsRemaining)
+                
+                # Format time remaining
+                $timeRemainingStr = if ($timeRemaining.TotalHours -ge 1) {
+                    "{0:0}h {1:0}m" -f $timeRemaining.TotalHours, $timeRemaining.Minutes
+                } elseif ($timeRemaining.TotalMinutes -ge 1) {
+                    "{0:0}m {1:0}s" -f $timeRemaining.TotalMinutes, $timeRemaining.Seconds
+                } else {
+                    "{0:0}s" -f $timeRemaining.TotalSeconds
+                }
+                
+                Write-Log "Uploading part $partNumber of $totalParts ($percentComplete%) - ETA: $timeRemainingStr" "INFO"
+                
+                # Upload the part
+                $etag = Send-S3Part `
+                    -BucketName $BucketName `
+                    -Key $Key `
+                    -UploadId $uploadId `
+                    -PartNumber $partNumber `
+                    -Data $chunk `
                     -AccessKey $AccessKey `
                     -SecretKey $SecretKey `
-                    -Headers $headers `
-                    -PayloadHash $payloadHash
+                    -Region $Region `
+                    -MaxRetries $script:MaxRetries
                 
-                $requestHeaders["Authorization"] = $authResult.Authorization
-                $requestHeaders["x-amz-date"] = $authResult.AmzDate
-            }
-            else {
-                throw "Failed to upload $Key after $MaxRetries attempts: $_"
+                $parts += @{
+                    PartNumber = $partNumber
+                    ETag = $etag
+                }
+                
+                $partNumber++
             }
         }
+        finally {
+            $stream.Close()
+        }
+        
+        # Step 3: Complete multipart upload
+        Complete-S3MultipartUpload `
+            -BucketName $BucketName `
+            -Key $Key `
+            -UploadId $uploadId `
+            -Parts $parts `
+            -AccessKey $AccessKey `
+            -SecretKey $SecretKey `
+            -Region $Region
+        
+        # Calculate total time
+        $totalTime = (Get-Date) - $startTime
+        $totalTimeStr = if ($totalTime.TotalHours -ge 1) {
+            "{0:0}h {1:0}m {2:0}s" -f $totalTime.TotalHours, $totalTime.Minutes, $totalTime.Seconds
+        } elseif ($totalTime.TotalMinutes -ge 1) {
+            "{0:0}m {1:0}s" -f $totalTime.TotalMinutes, $totalTime.Seconds
+        } else {
+            "{0:0}s" -f $totalTime.TotalSeconds
+        }
+        
+        $avgSpeedMBps = [math]::Round($fileSizeMB / $totalTime.TotalSeconds, 2)
+        
+        Write-Log "Upload complete: $fileSizeGB GB in $totalTimeStr (avg: $avgSpeedMBps MB/s)" "SUCCESS"
+        
+        return $true
     }
-    
-    return $success
+    catch {
+        # Abort the multipart upload on failure
+        if ($uploadId) {
+            Stop-S3MultipartUpload `
+                -BucketName $BucketName `
+                -Key $Key `
+                -UploadId $uploadId `
+                -AccessKey $AccessKey `
+                -SecretKey $SecretKey `
+                -Region $Region
+        }
+        
+        throw "Upload failed and was aborted: $_"
+    }
 }
 
 function Test-S3Connection {
@@ -303,21 +585,45 @@ function Test-S3Connection {
     )
     
     try {
+        Write-Log "Testing S3 connection..." "INFO"
+        
         $testKey = "$S3Prefix/_connection_test_$(Get-Date -Format 'yyyyMMddHHmmss').txt"
         $testContent = "Connection test - $(Get-Date)"
-        $testFile = Join-Path $env:TEMP "_s3_test_$((Get-Date -Format 'yyyyMMddHHmmss')).txt"
+        $testBytes = [System.Text.Encoding]::UTF8.GetBytes($testContent)
         
-        Set-Content -Path $testFile -Value $testContent -Encoding UTF8
+        # Simple PUT for small test file
+        $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$testKey"
+        $payloadHash = Get-SHA256Hash -Data $testBytes
         
-        Send-FileToS3 `
-            -BucketName $BucketName `
-            -Key $testKey `
-            -FilePath $testFile `
+        $headers = @{
+            "Host" = "s3.$Region.amazonaws.com"
+            "Content-Type" = "text/plain"
+        }
+        
+        $authResult = Get-AWSSignatureV4 `
+            -Method "PUT" `
+            -Uri $endpoint `
+            -Region $Region `
+            -Service "s3" `
             -AccessKey $AccessKey `
             -SecretKey $SecretKey `
-            -Region $Region
+            -Headers $headers `
+            -PayloadHash $payloadHash
         
-        Remove-Item $testFile -Force -ErrorAction SilentlyContinue
+        $requestHeaders = @{
+            "Authorization" = $authResult.Authorization
+            "x-amz-date" = $authResult.AmzDate
+            "x-amz-content-sha256" = $authResult.AmzContentSha256
+            "Content-Type" = "text/plain"
+            "Host" = "s3.$Region.amazonaws.com"
+        }
+        
+        Invoke-RestMethod `
+            -Uri $endpoint `
+            -Method PUT `
+            -Headers $requestHeaders `
+            -Body $testBytes `
+            -ContentType "text/plain" | Out-Null
         
         Write-Log "S3 connection test successful" "SUCCESS"
         return $true
@@ -353,7 +659,7 @@ function Get-LatestBakFile {
     }
     
     Write-Log "Found latest BAK file: $($latestBak.Name)" "INFO"
-    Write-Log "File size: $([math]::Round($latestBak.Length / 1MB, 2)) MB" "INFO"
+    Write-Log "File size: $([math]::Round($latestBak.Length / 1MB, 2)) MB ($([math]::Round($latestBak.Length / 1GB, 2)) GB)" "INFO"
     Write-Log "Last modified: $($latestBak.LastWriteTime)" "INFO"
     
     return $latestBak
@@ -380,7 +686,7 @@ function Start-BakFileUpload {
     Write-Log "S3 Bucket: $($Config.s3_bucket)" "INFO"
     Write-Log "S3 Key: $s3Key" "INFO"
     
-    # Upload to S3
+    # Upload to S3 using multipart upload
     $uploadResult = Send-FileToS3 `
         -BucketName $Config.s3_bucket `
         -Key $s3Key `
@@ -395,6 +701,7 @@ function Start-BakFileUpload {
             success = $true
             file_name = $bakFile.Name
             file_size_mb = [math]::Round($bakFile.Length / 1MB, 2)
+            file_size_gb = [math]::Round($bakFile.Length / 1GB, 2)
             s3_key = $s3Key
             timestamp = (Get-Date).ToString("o")
         }
@@ -424,6 +731,7 @@ function Main {
         Write-Log "Server: $($config.server_identifier)" "INFO"
         Write-Log "BAK File Path: $($config.bak_file_path)" "INFO"
         Write-Log "S3 Bucket: $($config.s3_bucket)" "INFO"
+        Write-Log "Part Size: $script:PartSizeMB MB" "INFO"
         
         # Clean old logs
         if ($config.log_retention_days -gt 0) {
@@ -431,7 +739,6 @@ function Main {
         }
         
         # Test S3 connection first
-        Write-Log "Testing S3 connection..." "INFO"
         $s3Test = Test-S3Connection `
             -BucketName $config.s3_bucket `
             -AccessKey $config.aws_access_key `
@@ -454,7 +761,7 @@ function Main {
         # Print summary
         Write-Log "=== Backup Complete ===" "SUCCESS"
         Write-Log "File: $($result.file_name)" "INFO"
-        Write-Log "Size: $($result.file_size_mb) MB" "INFO"
+        Write-Log "Size: $($result.file_size_mb) MB ($($result.file_size_gb) GB)" "INFO"
         Write-Log "S3 Location: s3://$($config.s3_bucket)/$($result.s3_key)" "INFO"
         
         exit 0
