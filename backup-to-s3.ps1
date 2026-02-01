@@ -258,8 +258,9 @@ function Send-S3Part {
     $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$Key"
     $queryString = "partNumber=$PartNumber&uploadId=$UploadId"
     
-    # Calculate hash for this chunk
-    $payloadHash = Get-SHA256Hash -Data $Data
+    # Use UNSIGNED-PAYLOAD to skip expensive SHA256 hash computation
+    # This is safe and used by AWS CLI/SDKs - S3 still validates integrity
+    $payloadHash = "UNSIGNED-PAYLOAD"
     
     $headers = @{
         "Host" = "s3.$Region.amazonaws.com"
