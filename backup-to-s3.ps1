@@ -855,33 +855,40 @@ function Start-BakFileUpload {
         $serverIdentifier = $env:COMPUTERNAME
     }
     
-    # Get the latest .bak file
-    $bakFile = Get-LatestBakFile -BakDirectory $Config.bak_file_path
-    
     # Determine if compression is enabled
     $compressionEnabled = $Config.compression_enabled -eq $true
     
-    # Variables to track file to upload and cleanup
-    $fileToUpload = $bakFile
-    $compressedFilePath = $null
+    # Variables to track file to upload
+    $fileToUpload = $null
     
-    # Compress if enabled
     if ($compressionEnabled) {
-        Write-Log "Compression is ENABLED - compressing before upload" "INFO"
+        # TEST MODE: Skip compression, look for existing .rar file in temp_directory
+        Write-Log "Compression ENABLED - looking for existing .rar file in temp_directory (TEST MODE)" "INFO"
+        Write-Log "Searching for .rar files in: $($Config.temp_directory)" "INFO"
         
-        $compressionLevel = if ($null -ne $Config.compression_level) { $Config.compression_level } else { 5 }
+        if (-not (Test-Path $Config.temp_directory)) {
+            throw "Temp directory does not exist: $($Config.temp_directory)"
+        }
         
-        $compressedFile = Compress-BakFile `
-            -BakFilePath $bakFile.FullName `
-            -TempDirectory $Config.temp_directory `
-            -RarPath $Config.rar_executable_path `
-            -CompressionLevel $compressionLevel
+        # Find the latest .rar file in temp_directory
+        $rarFile = Get-ChildItem -Path $Config.temp_directory -Filter "*.rar" -File | 
+                   Sort-Object LastWriteTime -Descending | 
+                   Select-Object -First 1
         
-        $fileToUpload = $compressedFile
-        $compressedFilePath = $compressedFile.FullName
+        if (-not $rarFile) {
+            throw "No .rar files found in temp_directory: $($Config.temp_directory). Please place your pre-compressed .rar file there."
+        }
+        
+        Write-Log "Found .rar file: $($rarFile.Name)" "SUCCESS"
+        Write-Log "File size: $([math]::Round($rarFile.Length / 1MB, 2)) MB ($([math]::Round($rarFile.Length / 1GB, 2)) GB)" "INFO"
+        Write-Log "Last modified: $($rarFile.LastWriteTime)" "INFO"
+        
+        $fileToUpload = $rarFile
     }
     else {
+        # Get the latest .bak file
         Write-Log "Compression is DISABLED - uploading raw .bak file" "INFO"
+        $fileToUpload = Get-LatestBakFile -BakDirectory $Config.bak_file_path
     }
     
     # Build S3 key with server identifier and date
@@ -904,17 +911,12 @@ function Start-BakFileUpload {
         if ($uploadResult) {
             Write-Log "File uploaded successfully to S3" "SUCCESS"
             
-            # Clean up compressed file after successful upload
-            if ($compressedFilePath) {
-                Remove-CompressedFile -FilePath $compressedFilePath
-            }
+            # TEST MODE: Do NOT delete the .rar file (we didn't create it)
+            Write-Log "TEST MODE: Keeping .rar file (not deleting)" "INFO"
             
             return @{
                 success = $true
-                original_file_name = $bakFile.Name
                 uploaded_file_name = $fileToUpload.Name
-                original_size_mb = [math]::Round($bakFile.Length / 1MB, 2)
-                original_size_gb = [math]::Round($bakFile.Length / 1GB, 2)
                 uploaded_size_mb = [math]::Round($fileToUpload.Length / 1MB, 2)
                 uploaded_size_gb = [math]::Round($fileToUpload.Length / 1GB, 2)
                 compression_enabled = $compressionEnabled
@@ -927,10 +929,7 @@ function Start-BakFileUpload {
         }
     }
     catch {
-        # On upload failure, keep the compressed file for potential retry
-        if ($compressedFilePath -and (Test-Path $compressedFilePath)) {
-            Write-Log "Upload failed - keeping compressed file for retry: $compressedFilePath" "WARN"
-        }
+        Write-Log "Upload failed: $_" "ERROR"
         throw $_
     }
 }
@@ -997,16 +996,8 @@ function Main {
         
         # Print summary
         Write-Log "=== Backup Complete ===" "SUCCESS"
-        Write-Log "Original File: $($result.original_file_name)" "INFO"
         Write-Log "Uploaded File: $($result.uploaded_file_name)" "INFO"
-        if ($result.compression_enabled) {
-            Write-Log "Original Size: $($result.original_size_gb) GB -> Uploaded Size: $($result.uploaded_size_gb) GB" "INFO"
-            $compressionRatio = [math]::Round(($result.uploaded_size_mb / $result.original_size_mb) * 100, 1)
-            Write-Log "Compression Ratio: $compressionRatio% of original" "INFO"
-        }
-        else {
-            Write-Log "Size: $($result.original_size_mb) MB ($($result.original_size_gb) GB)" "INFO"
-        }
+        Write-Log "Size: $($result.uploaded_size_mb) MB ($($result.uploaded_size_gb) GB)" "INFO"
         Write-Log "S3 Location: s3://$($config.s3_bucket)/$($result.s3_key)" "INFO"
         
         exit 0
