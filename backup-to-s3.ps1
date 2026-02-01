@@ -636,6 +636,183 @@ function Test-S3Connection {
 
 #endregion
 
+#region ==================== RAR COMPRESSION ====================
+
+function Test-RarExecutable {
+    param(
+        [string]$RarPath
+    )
+    
+    Write-Log "Validating RAR executable: $RarPath" "INFO"
+    
+    if ([string]::IsNullOrEmpty($RarPath)) {
+        throw "RAR executable path is not configured. Set 'rar_executable_path' in config.json"
+    }
+    
+    if (-not (Test-Path $RarPath)) {
+        throw "RAR executable not found at: $RarPath. Please install WinRAR or update the path in config.json"
+    }
+    
+    # Test if it's actually executable
+    try {
+        $versionOutput = & $RarPath 2>&1 | Select-Object -First 1
+        if ($versionOutput -match "RAR") {
+            Write-Log "RAR executable validated: $versionOutput" "SUCCESS"
+            return $true
+        }
+        else {
+            throw "File at $RarPath does not appear to be a valid RAR executable"
+        }
+    }
+    catch {
+        throw "Failed to execute RAR at $RarPath : $_"
+    }
+}
+
+function Compress-BakFile {
+    param(
+        [string]$BakFilePath,
+        [string]$TempDirectory,
+        [string]$RarPath,
+        [int]$CompressionLevel = 5
+    )
+    
+    $bakFileInfo = Get-Item $BakFilePath
+    $bakSizeMB = [math]::Round($bakFileInfo.Length / 1MB, 2)
+    $bakSizeGB = [math]::Round($bakFileInfo.Length / 1GB, 2)
+    
+    Write-Log "Starting RAR compression..." "INFO"
+    Write-Log "Source file: $($bakFileInfo.Name) ($bakSizeGB GB)" "INFO"
+    Write-Log "Compression level: $CompressionLevel (0=store, 5=best)" "INFO"
+    
+    # Create temp directory if it doesn't exist
+    if (-not (Test-Path $TempDirectory)) {
+        Write-Log "Creating temp directory: $TempDirectory" "INFO"
+        New-Item -ItemType Directory -Path $TempDirectory -Force | Out-Null
+    }
+    
+    # Build output path - same name but .rar extension
+    $rarFileName = [System.IO.Path]::GetFileNameWithoutExtension($bakFileInfo.Name) + ".rar"
+    $rarFilePath = Join-Path $TempDirectory $rarFileName
+    
+    # Remove existing RAR file if present (from previous failed attempt)
+    if (Test-Path $rarFilePath) {
+        Write-Log "Removing existing RAR file from previous attempt: $rarFilePath" "WARN"
+        Remove-Item $rarFilePath -Force
+    }
+    
+    Write-Log "Output file: $rarFilePath" "INFO"
+    
+    $startTime = Get-Date
+    
+    try {
+        # Build RAR command arguments
+        # a = add to archive
+        # -m<n> = compression level (0-5)
+        # -ep1 = exclude base directory from names
+        # -y = assume yes on all queries
+        # -idq = quiet mode (disable messages)
+        $arguments = @(
+            "a",
+            "-m$CompressionLevel",
+            "-ep1",
+            "-y",
+            "-idq",
+            "`"$rarFilePath`"",
+            "`"$BakFilePath`""
+        )
+        
+        Write-Log "Executing: $RarPath $($arguments -join ' ')" "INFO"
+        
+        # Run RAR compression
+        $process = Start-Process -FilePath $RarPath `
+            -ArgumentList $arguments `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput "$TempDirectory\rar_stdout.txt" `
+            -RedirectStandardError "$TempDirectory\rar_stderr.txt"
+        
+        # Check exit code
+        if ($process.ExitCode -ne 0) {
+            $stderr = ""
+            if (Test-Path "$TempDirectory\rar_stderr.txt") {
+                $stderr = Get-Content "$TempDirectory\rar_stderr.txt" -Raw
+            }
+            throw "RAR compression failed with exit code $($process.ExitCode). Error: $stderr"
+        }
+        
+        # Verify the RAR file was created
+        if (-not (Test-Path $rarFilePath)) {
+            throw "RAR compression completed but output file not found: $rarFilePath"
+        }
+        
+        $rarFileInfo = Get-Item $rarFilePath
+        $rarSizeMB = [math]::Round($rarFileInfo.Length / 1MB, 2)
+        $rarSizeGB = [math]::Round($rarFileInfo.Length / 1GB, 2)
+        
+        $compressionTime = (Get-Date) - $startTime
+        $compressionTimeStr = if ($compressionTime.TotalHours -ge 1) {
+            "{0:0}h {1:0}m {2:0}s" -f $compressionTime.TotalHours, $compressionTime.Minutes, $compressionTime.Seconds
+        } elseif ($compressionTime.TotalMinutes -ge 1) {
+            "{0:0}m {1:0}s" -f $compressionTime.TotalMinutes, $compressionTime.Seconds
+        } else {
+            "{0:0}s" -f $compressionTime.TotalSeconds
+        }
+        
+        $compressionRatio = [math]::Round(($rarFileInfo.Length / $bakFileInfo.Length) * 100, 1)
+        $spaceSaved = [math]::Round(($bakFileInfo.Length - $rarFileInfo.Length) / 1GB, 2)
+        
+        Write-Log "Compression complete in $compressionTimeStr" "SUCCESS"
+        Write-Log "Original size: $bakSizeGB GB -> Compressed size: $rarSizeGB GB ($compressionRatio% of original)" "INFO"
+        Write-Log "Space saved: $spaceSaved GB" "INFO"
+        
+        # Clean up temp log files
+        Remove-Item "$TempDirectory\rar_stdout.txt" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$TempDirectory\rar_stderr.txt" -Force -ErrorAction SilentlyContinue
+        
+        return $rarFileInfo
+    }
+    catch {
+        # Clean up partial RAR file on failure
+        if (Test-Path $rarFilePath) {
+            Write-Log "Cleaning up partial RAR file after failure" "WARN"
+            Remove-Item $rarFilePath -Force -ErrorAction SilentlyContinue
+        }
+        
+        # Clean up temp log files
+        Remove-Item "$TempDirectory\rar_stdout.txt" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$TempDirectory\rar_stderr.txt" -Force -ErrorAction SilentlyContinue
+        
+        throw "Compression failed: $_"
+    }
+}
+
+function Remove-CompressedFile {
+    param(
+        [string]$FilePath
+    )
+    
+    if (Test-Path $FilePath) {
+        Write-Log "Cleaning up compressed file: $FilePath" "INFO"
+        try {
+            Remove-Item $FilePath -Force
+            Write-Log "Compressed file removed successfully" "SUCCESS"
+            return $true
+        }
+        catch {
+            Write-Log "Failed to remove compressed file: $_" "WARN"
+            return $false
+        }
+    }
+    else {
+        Write-Log "Compressed file not found for cleanup: $FilePath" "WARN"
+        return $false
+    }
+}
+
+#endregion
+
 #region ==================== MAIN BACKUP LOGIC ====================
 
 function Get-LatestBakFile {
@@ -679,35 +856,80 @@ function Start-BakFileUpload {
     # Get the latest .bak file
     $bakFile = Get-LatestBakFile -BakDirectory $Config.bak_file_path
     
+    # Determine if compression is enabled
+    $compressionEnabled = $Config.compression_enabled -eq $true
+    
+    # Variables to track file to upload and cleanup
+    $fileToUpload = $bakFile
+    $compressedFilePath = $null
+    
+    # Compress if enabled
+    if ($compressionEnabled) {
+        Write-Log "Compression is ENABLED - compressing before upload" "INFO"
+        
+        $compressionLevel = if ($null -ne $Config.compression_level) { $Config.compression_level } else { 5 }
+        
+        $compressedFile = Compress-BakFile `
+            -BakFilePath $bakFile.FullName `
+            -TempDirectory $Config.temp_directory `
+            -RarPath $Config.rar_executable_path `
+            -CompressionLevel $compressionLevel
+        
+        $fileToUpload = $compressedFile
+        $compressedFilePath = $compressedFile.FullName
+    }
+    else {
+        Write-Log "Compression is DISABLED - uploading raw .bak file" "INFO"
+    }
+    
     # Build S3 key with server identifier and date
-    $s3Key = "$($Config.s3_prefix)/$serverIdentifier/$date/$($bakFile.Name)"
+    $s3Key = "$($Config.s3_prefix)/$serverIdentifier/$date/$($fileToUpload.Name)"
     
     Write-Log "Starting upload to S3..." "INFO"
     Write-Log "S3 Bucket: $($Config.s3_bucket)" "INFO"
     Write-Log "S3 Key: $s3Key" "INFO"
     
-    # Upload to S3 using multipart upload
-    $uploadResult = Send-FileToS3 `
-        -BucketName $Config.s3_bucket `
-        -Key $s3Key `
-        -FilePath $bakFile.FullName `
-        -AccessKey $Config.aws_access_key `
-        -SecretKey $Config.aws_secret_key `
-        -Region $Config.s3_region
-    
-    if ($uploadResult) {
-        Write-Log "BAK file uploaded successfully to S3" "SUCCESS"
-        return @{
-            success = $true
-            file_name = $bakFile.Name
-            file_size_mb = [math]::Round($bakFile.Length / 1MB, 2)
-            file_size_gb = [math]::Round($bakFile.Length / 1GB, 2)
-            s3_key = $s3Key
-            timestamp = (Get-Date).ToString("o")
+    try {
+        # Upload to S3 using multipart upload
+        $uploadResult = Send-FileToS3 `
+            -BucketName $Config.s3_bucket `
+            -Key $s3Key `
+            -FilePath $fileToUpload.FullName `
+            -AccessKey $Config.aws_access_key `
+            -SecretKey $Config.aws_secret_key `
+            -Region $Config.s3_region
+        
+        if ($uploadResult) {
+            Write-Log "File uploaded successfully to S3" "SUCCESS"
+            
+            # Clean up compressed file after successful upload
+            if ($compressedFilePath) {
+                Remove-CompressedFile -FilePath $compressedFilePath
+            }
+            
+            return @{
+                success = $true
+                original_file_name = $bakFile.Name
+                uploaded_file_name = $fileToUpload.Name
+                original_size_mb = [math]::Round($bakFile.Length / 1MB, 2)
+                original_size_gb = [math]::Round($bakFile.Length / 1GB, 2)
+                uploaded_size_mb = [math]::Round($fileToUpload.Length / 1MB, 2)
+                uploaded_size_gb = [math]::Round($fileToUpload.Length / 1GB, 2)
+                compression_enabled = $compressionEnabled
+                s3_key = $s3Key
+                timestamp = (Get-Date).ToString("o")
+            }
+        }
+        else {
+            throw "Failed to upload file to S3"
         }
     }
-    else {
-        throw "Failed to upload BAK file to S3"
+    catch {
+        # On upload failure, keep the compressed file for potential retry
+        if ($compressedFilePath -and (Test-Path $compressedFilePath)) {
+            Write-Log "Upload failed - keeping compressed file for retry: $compressedFilePath" "WARN"
+        }
+        throw $_
     }
 }
 
@@ -732,6 +954,19 @@ function Main {
         Write-Log "BAK File Path: $($config.bak_file_path)" "INFO"
         Write-Log "S3 Bucket: $($config.s3_bucket)" "INFO"
         Write-Log "Part Size: $script:PartSizeMB MB" "INFO"
+        
+        # Log and validate compression settings
+        $compressionEnabled = $config.compression_enabled -eq $true
+        Write-Log "Compression: $(if ($compressionEnabled) { 'ENABLED' } else { 'DISABLED' })" "INFO"
+        
+        if ($compressionEnabled) {
+            Write-Log "RAR Path: $($config.rar_executable_path)" "INFO"
+            Write-Log "Compression Level: $($config.compression_level)" "INFO"
+            Write-Log "Temp Directory: $($config.temp_directory)" "INFO"
+            
+            # Validate RAR executable exists and is functional
+            Test-RarExecutable -RarPath $config.rar_executable_path
+        }
         
         # Clean old logs
         if ($config.log_retention_days -gt 0) {
@@ -760,8 +995,16 @@ function Main {
         
         # Print summary
         Write-Log "=== Backup Complete ===" "SUCCESS"
-        Write-Log "File: $($result.file_name)" "INFO"
-        Write-Log "Size: $($result.file_size_mb) MB ($($result.file_size_gb) GB)" "INFO"
+        Write-Log "Original File: $($result.original_file_name)" "INFO"
+        Write-Log "Uploaded File: $($result.uploaded_file_name)" "INFO"
+        if ($result.compression_enabled) {
+            Write-Log "Original Size: $($result.original_size_gb) GB -> Uploaded Size: $($result.uploaded_size_gb) GB" "INFO"
+            $compressionRatio = [math]::Round(($result.uploaded_size_mb / $result.original_size_mb) * 100, 1)
+            Write-Log "Compression Ratio: $compressionRatio% of original" "INFO"
+        }
+        else {
+            Write-Log "Size: $($result.original_size_mb) MB ($($result.original_size_gb) GB)" "INFO"
+        }
         Write-Log "S3 Location: s3://$($config.s3_bucket)/$($result.s3_key)" "INFO"
         
         exit 0

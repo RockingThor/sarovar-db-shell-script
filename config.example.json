@@ -29,5 +29,17 @@
   "_log_retention_days_help": "Number of days to keep log files. Set to 0 to disable cleanup.",
 
   "backup_time": "02:00",
-  "_backup_time_help": "Time to run daily backup (24-hour format). Used by installer to create scheduled task."
+  "_backup_time_help": "Time to run daily backup (24-hour format). Used by installer to create scheduled task.",
+
+  "compression_enabled": true,
+  "_compression_enabled_help": "Enable RAR compression before upload. Significantly reduces upload size (e.g., 20GB -> 1.3GB).",
+
+  "rar_executable_path": "C:\\Program Files\\WinRAR\\rar.exe",
+  "_rar_executable_path_help": "Full path to WinRAR command-line executable (rar.exe). Required if compression is enabled.",
+
+  "compression_level": 5,
+  "_compression_level_help": "RAR compression level: 0 (store/no compression) to 5 (best/maximum compression). Default is 5.",
+
+  "temp_directory": "C:\\SarovarBackup\\temp",
+  "_temp_directory_help": "Directory for temporary compressed files. Should have enough free space for the compressed backup."
 }

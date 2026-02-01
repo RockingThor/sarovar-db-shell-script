@@ -24,12 +24,23 @@
     Unique server identifier (default: hostname)
 .PARAMETER S3Prefix
     S3 prefix/folder for uploads (default: backups)
+.PARAMETER CompressionEnabled
+    Enable RAR compression before upload (default: false for silent mode)
+.PARAMETER RarPath
+    Path to WinRAR rar.exe executable
+.PARAMETER CompressionLevel
+    RAR compression level 0-5 (default: 5 for best compression)
+.PARAMETER TempDirectory
+    Directory for temporary compressed files (default: InstallPath\temp)
 .EXAMPLE
     # Interactive installation
     .\install.ps1
 .EXAMPLE
     # Silent installation with parameters
     .\install.ps1 -Silent -S3Bucket "my-bucket" -BakFilePath "D:\Backups" -AwsAccessKey "AKIA..." -AwsSecretKey "xxx"
+.EXAMPLE
+    # Silent installation with compression
+    .\install.ps1 -Silent -S3Bucket "my-bucket" -BakFilePath "D:\Backups" -AwsAccessKey "AKIA..." -AwsSecretKey "xxx" -CompressionEnabled -RarPath "C:\Program Files\WinRAR\rar.exe"
 #>
 
 param(
@@ -42,7 +53,11 @@ param(
     [string]$BackupTime = "02:00",
     [string]$InstallPath = "C:\SarovarBackup",
     [string]$ServerIdentifier = $env:COMPUTERNAME,
-    [string]$S3Prefix = "backups"
+    [string]$S3Prefix = "backups",
+    [switch]$CompressionEnabled,
+    [string]$RarPath,
+    [int]$CompressionLevel = 5,
+    [string]$TempDirectory
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,6 +96,56 @@ function Read-SecureInput {
     }
     finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+function Find-WinRarPath {
+    # Check common WinRAR installation paths
+    $commonPaths = @(
+        "C:\Program Files\WinRAR\rar.exe",
+        "C:\Program Files (x86)\WinRAR\rar.exe"
+    )
+    
+    foreach ($path in $commonPaths) {
+        if (Test-Path $path) {
+            return $path
+        }
+    }
+    
+    # Try to find via registry
+    try {
+        $regPath = Get-ItemProperty "HKLM:\SOFTWARE\WinRAR" -ErrorAction SilentlyContinue
+        if ($regPath -and $regPath.exe64) {
+            $rarPath = Join-Path (Split-Path $regPath.exe64) "rar.exe"
+            if (Test-Path $rarPath) {
+                return $rarPath
+            }
+        }
+    }
+    catch {
+        # Registry lookup failed, continue
+    }
+    
+    return $null
+}
+
+function Test-RarExecutable {
+    param([string]$RarPath)
+    
+    if ([string]::IsNullOrEmpty($RarPath)) {
+        return $false
+    }
+    
+    if (-not (Test-Path $RarPath)) {
+        return $false
+    }
+    
+    try {
+        $output = & $RarPath 2>&1 | Select-Object -First 1
+        return $output -match "RAR"
+    }
+    catch {
+        return $false
     }
 }
 
@@ -383,6 +448,31 @@ function Main {
             exit 1
         }
         
+        # Determine temp directory for silent mode
+        $silentTempDir = if ([string]::IsNullOrEmpty($TempDirectory)) { 
+            Join-Path $InstallPath "temp" 
+        } else { 
+            $TempDirectory 
+        }
+        
+        # Validate RAR path if compression is enabled in silent mode
+        if ($CompressionEnabled) {
+            if ([string]::IsNullOrEmpty($RarPath)) {
+                # Try auto-detect
+                $RarPath = Find-WinRarPath
+                if ([string]::IsNullOrEmpty($RarPath)) {
+                    Write-Status "Compression enabled but RarPath not specified and WinRAR not found" "Error"
+                    exit 1
+                }
+                Write-Status "Auto-detected WinRAR at: $RarPath" "Info"
+            }
+            
+            if (-not (Test-RarExecutable -RarPath $RarPath)) {
+                Write-Status "Invalid or non-functional RAR executable: $RarPath" "Error"
+                exit 1
+            }
+        }
+        
         $config = @{
             server_identifier = $ServerIdentifier
             bak_file_path = $BakFilePath
@@ -394,6 +484,10 @@ function Main {
             log_directory = Join-Path $InstallPath "logs"
             log_retention_days = 30
             backup_time = $BackupTime
+            compression_enabled = [bool]$CompressionEnabled
+            rar_executable_path = $RarPath
+            compression_level = $CompressionLevel
+            temp_directory = $silentTempDir
         }
     }
     else {
@@ -499,6 +593,77 @@ function Main {
         $inputInstallPath = Read-Host "Installation directory [$InstallPath]"
         if ([string]::IsNullOrWhiteSpace($inputInstallPath)) { $inputInstallPath = $InstallPath }
         
+        Write-Host ""
+        Write-Host "--- Step 5: Compression Configuration ---" -ForegroundColor Yellow
+        Write-Host ""
+        
+        # Auto-detect WinRAR
+        $detectedRarPath = Find-WinRarPath
+        $inputCompressionEnabled = $false
+        $inputRarPath = ""
+        $inputCompressionLevel = 5
+        $inputTempDirectory = Join-Path $inputInstallPath "temp"
+        
+        if ($detectedRarPath) {
+            Write-Status "WinRAR detected at: $detectedRarPath" "Success"
+            $enableCompression = Read-Host "Enable RAR compression before upload? (Y/n)"
+            if ($enableCompression -ne 'n' -and $enableCompression -ne 'N') {
+                $inputCompressionEnabled = $true
+                
+                # Ask if they want to use detected path or custom
+                $useDetectedPath = Read-Host "Use detected path? (Y/n)"
+                if ($useDetectedPath -eq 'n' -or $useDetectedPath -eq 'N') {
+                    $inputRarPath = Read-Host "Enter path to rar.exe"
+                }
+                else {
+                    $inputRarPath = $detectedRarPath
+                }
+            }
+        }
+        else {
+            Write-Status "WinRAR not detected in common locations" "Warning"
+            $enableCompression = Read-Host "Enable RAR compression? (y/N)"
+            if ($enableCompression -eq 'y' -or $enableCompression -eq 'Y') {
+                $inputCompressionEnabled = $true
+                $inputRarPath = Read-Host "Enter path to rar.exe (e.g., C:\Program Files\WinRAR\rar.exe)"
+                if ([string]::IsNullOrWhiteSpace($inputRarPath)) {
+                    Write-Status "RAR path is required when compression is enabled" "Error"
+                    exit 1
+                }
+            }
+        }
+        
+        # If compression enabled, get additional settings and validate
+        if ($inputCompressionEnabled) {
+            # Validate RAR executable
+            if (-not (Test-RarExecutable -RarPath $inputRarPath)) {
+                Write-Status "Invalid or non-functional RAR executable: $inputRarPath" "Error"
+                exit 1
+            }
+            Write-Status "RAR executable validated successfully" "Success"
+            
+            # Compression level
+            $levelInput = Read-Host "Compression level 0-5 (0=store, 5=best) [$inputCompressionLevel]"
+            if (-not [string]::IsNullOrWhiteSpace($levelInput)) {
+                $inputCompressionLevel = [int]$levelInput
+                if ($inputCompressionLevel -lt 0 -or $inputCompressionLevel -gt 5) {
+                    Write-Status "Invalid compression level. Using default: 5" "Warning"
+                    $inputCompressionLevel = 5
+                }
+            }
+            
+            # Temp directory
+            $tempInput = Read-Host "Temp directory for compressed files [$inputTempDirectory]"
+            if (-not [string]::IsNullOrWhiteSpace($tempInput)) {
+                $inputTempDirectory = $tempInput
+            }
+            
+            Write-Status "Compression enabled with level $inputCompressionLevel" "Success"
+        }
+        else {
+            Write-Status "Compression disabled - will upload raw .bak files" "Info"
+        }
+        
         $config = @{
             server_identifier = $inputServerIdentifier
             bak_file_path = $inputBakFilePath
@@ -510,6 +675,10 @@ function Main {
             log_directory = Join-Path $inputInstallPath "logs"
             log_retention_days = 30
             backup_time = $inputBackupTime
+            compression_enabled = $inputCompressionEnabled
+            rar_executable_path = $inputRarPath
+            compression_level = $inputCompressionLevel
+            temp_directory = $inputTempDirectory
         }
         
         $InstallPath = $inputInstallPath
