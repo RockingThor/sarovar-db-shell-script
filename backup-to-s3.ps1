@@ -437,6 +437,85 @@ function Stop-S3MultipartUpload {
 
 #region ==================== S3 FILE UPLOAD ====================
 
+function Send-S3SinglePut {
+    param(
+        [string]$BucketName,
+        [string]$Key,
+        [string]$FilePath,
+        [string]$AccessKey,
+        [string]$SecretKey,
+        [string]$Region
+    )
+    
+    $fileInfo = Get-Item $FilePath
+    $fileSizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
+    
+    Write-Log "Using single PUT upload for file: $($fileInfo.Name) ($fileSizeMB MB)" "INFO"
+    
+    $endpoint = "https://s3.$Region.amazonaws.com/$BucketName/$Key"
+    
+    # Use UNSIGNED-PAYLOAD for speed (skip SHA256 hashing)
+    $payloadHash = "UNSIGNED-PAYLOAD"
+    
+    $headers = @{
+        "Host" = "s3.$Region.amazonaws.com"
+        "Content-Type" = "application/octet-stream"
+    }
+    
+    $startTime = Get-Date
+    
+    try {
+        $authResult = Get-AWSSignatureV4 `
+            -Method "PUT" `
+            -Uri $endpoint `
+            -Region $Region `
+            -Service "s3" `
+            -AccessKey $AccessKey `
+            -SecretKey $SecretKey `
+            -Headers $headers `
+            -PayloadHash $payloadHash
+        
+        $requestHeaders = @{
+            "Authorization" = $authResult.Authorization
+            "x-amz-date" = $authResult.AmzDate
+            "x-amz-content-sha256" = $authResult.AmzContentSha256
+            "Content-Type" = "application/octet-stream"
+            "Host" = "s3.$Region.amazonaws.com"
+        }
+        
+        # Read file and upload in single request
+        Write-Log "Uploading file..." "INFO"
+        $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
+        
+        Invoke-RestMethod `
+            -Uri $endpoint `
+            -Method PUT `
+            -Headers $requestHeaders `
+            -Body $fileBytes `
+            -ContentType "application/octet-stream"
+        
+        # Calculate upload time and speed
+        $totalTime = (Get-Date) - $startTime
+        $totalTimeStr = if ($totalTime.TotalMinutes -ge 1) {
+            "{0:0}m {1:0}s" -f $totalTime.TotalMinutes, $totalTime.Seconds
+        } else {
+            "{0:0}s" -f $totalTime.TotalSeconds
+        }
+        
+        $avgSpeedMBps = if ($totalTime.TotalSeconds -gt 0) {
+            [math]::Round($fileSizeMB / $totalTime.TotalSeconds, 2)
+        } else { 0 }
+        
+        Write-Log "Single PUT upload complete: $fileSizeMB MB in $totalTimeStr (avg: $avgSpeedMBps MB/s)" "SUCCESS"
+        
+        return $true
+    }
+    catch {
+        Write-Log "Single PUT upload failed: $_" "ERROR"
+        throw "Single PUT upload failed: $_"
+    }
+}
+
 function Send-FileToS3 {
     param(
         [string]$BucketName,
@@ -454,6 +533,24 @@ function Send-FileToS3 {
     
     Write-Log "Starting upload: $($fileInfo.Name)" "INFO"
     Write-Log "File size: $fileSizeMB MB ($fileSizeGB GB)" "INFO"
+    
+    # Threshold: 3GB - use single PUT for smaller files (faster, less overhead)
+    # S3 allows up to 5GB for single PUT, using 3GB as safe limit
+    $singlePutThresholdBytes = 3 * 1GB
+    
+    if ($fileSizeBytes -lt $singlePutThresholdBytes) {
+        Write-Log "File under 3GB - using single PUT (faster than multipart)" "INFO"
+        return Send-S3SinglePut `
+            -BucketName $BucketName `
+            -Key $Key `
+            -FilePath $FilePath `
+            -AccessKey $AccessKey `
+            -SecretKey $SecretKey `
+            -Region $Region
+    }
+    
+    # File is 3GB+ - use multipart upload
+    Write-Log "File over 3GB - using multipart upload" "INFO"
     
     # Calculate total parts
     $totalParts = [math]::Ceiling($fileSizeBytes / $script:PartSizeBytes)
