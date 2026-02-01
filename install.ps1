@@ -141,8 +141,10 @@ function Test-RarExecutable {
     }
     
     try {
-        $output = & $RarPath 2>&1 | Select-Object -First 1
-        return $output -match "RAR"
+        # Check multiple lines of output for "RAR" string (not just first line)
+        $output = & $RarPath 2>&1 | Select-Object -First 10
+        $outputText = $output -join "`n"
+        return $outputText -match "RAR"
     }
     catch {
         return $false

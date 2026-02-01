@@ -653,11 +653,12 @@ function Test-RarExecutable {
         throw "RAR executable not found at: $RarPath. Please install WinRAR or update the path in config.json"
     }
     
-    # Test if it's actually executable
+    # Test if it's actually executable - check multiple lines of output (not just first line)
     try {
-        $versionOutput = & $RarPath 2>&1 | Select-Object -First 1
-        if ($versionOutput -match "RAR") {
-            Write-Log "RAR executable validated: $versionOutput" "SUCCESS"
+        $versionOutput = & $RarPath 2>&1 | Select-Object -First 10
+        $outputText = $versionOutput -join "`n"
+        if ($outputText -match "RAR") {
+            Write-Log "RAR executable validated successfully" "SUCCESS"
             return $true
         }
         else {
