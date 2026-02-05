@@ -11,12 +11,14 @@ Usage:
         <pg_host> <pg_port> <pg_db> <pg_user> <pg_password>
 """
 
+import io
 import sys
 import urllib.parse
 from datetime import datetime
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+import psycopg2
+from sqlalchemy import create_engine
 
 
 # Tables to migrate
@@ -24,26 +26,28 @@ TABLES_REQUIRED = ["FMTRNVEW", "PSHP4VEW", "FMR01VEW"]
 
 # MSSQL to PostgreSQL type mapping
 TYPE_MAP = {
-    "int": "integer",
-    "bigint": "bigint",
-    "smallint": "smallint",
-    "tinyint": "smallint",
-    "bit": "boolean",
-    "decimal": "numeric",
-    "numeric": "numeric",
-    "money": "numeric(18,2)",
-    "float": "double precision",
-    "real": "real",
-    "datetime": "timestamp",
-    "datetime2": "timestamp",
-    "smalldatetime": "timestamp",
-    "date": "date",
-    "nvarchar": "varchar",
-    "varchar": "varchar",
-    "char": "char",
-    "nchar": "char",
-    "text": "text",
-    "uniqueidentifier": "uuid",
+    "int": "INTEGER",
+    "bigint": "BIGINT",
+    "smallint": "SMALLINT",
+    "tinyint": "SMALLINT",
+    "bit": "BOOLEAN",
+    "decimal": "NUMERIC",
+    "numeric": "NUMERIC",
+    "float": "DOUBLE PRECISION",
+    "real": "REAL",
+    "money": "NUMERIC(19,4)",
+    "datetime": "TIMESTAMP",
+    "datetime2": "TIMESTAMP",
+    "smalldatetime": "TIMESTAMP",
+    "date": "DATE",
+    "time": "TIME",
+    "char": "CHAR",
+    "nchar": "CHAR",
+    "varchar": "VARCHAR",
+    "nvarchar": "VARCHAR",
+    "text": "TEXT",
+    "ntext": "TEXT",
+    "uniqueidentifier": "UUID",
 }
 
 # Chunk size for data transfer
@@ -65,16 +69,23 @@ def create_mssql_engine(host: str, database: str, user: str, password: str):
         f"UID={user};"
         f"PWD={password}"
     )
-    return create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
-
-
-def create_pg_engine(host: str, port: str, database: str, user: str, password: str):
-    """Create SQLAlchemy engine for PostgreSQL."""
     return create_engine(
-        f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}", executemany_mode="values",
-    executemany_values_page_size=10000,
-    executemany_batch_page_size=500
+        f"mssql+pyodbc:///?odbc_connect={params}",
+        fast_executemany=True
     )
+
+
+def create_pg_connection(host: str, port: str, database: str, user: str, password: str):
+    """Create psycopg2 connection for PostgreSQL."""
+    conn = psycopg2.connect(
+        host=host,
+        database=database,
+        user=user,
+        password=password,
+        port=int(port),
+    )
+    conn.autocommit = False
+    return conn
 
 
 def get_schema_info(mssql_engine, tables: list) -> pd.DataFrame:
@@ -100,58 +111,61 @@ def get_schema_info(mssql_engine, tables: list) -> pd.DataFrame:
     return schema_df
 
 
-def create_tables(pg_engine, schema_df: pd.DataFrame) -> None:
+def create_tables(pg_conn, schema_df: pd.DataFrame) -> None:
     """Create tables in PostgreSQL based on MSSQL schema."""
-    with pg_engine.connect() as conn:
-        for table in schema_df["TABLE_NAME"].unique():
-            try:
-                cols = schema_df[schema_df["TABLE_NAME"] == table]
+    pg_cur = pg_conn.cursor()
 
-                col_defs = []
-                for _, row in cols.iterrows():
-                    pg_type = TYPE_MAP.get(row["DATA_TYPE"], "text")
+    for table in schema_df["TABLE_NAME"].unique():
+        try:
+            group = schema_df[schema_df["TABLE_NAME"] == table]
 
-                    # Add length for char types
-                    if row["CHARACTER_MAXIMUM_LENGTH"] and "char" in pg_type:
-                        pg_type += f"({int(row['CHARACTER_MAXIMUM_LENGTH'])})"
+            cols = []
+            for _, row in group.iterrows():
+                pg_type = TYPE_MAP.get(row["DATA_TYPE"].lower(), "TEXT")
+                col = f'"{row["COLUMN_NAME"]}" {pg_type}'
+                cols.append(col)
 
-                    col_defs.append(f'"{row["COLUMN_NAME"]}" {pg_type}')
+            create_sql = f'''
+            CREATE TABLE IF NOT EXISTS "{table}" (
+                {", ".join(cols)}
+            );
+            '''
 
-                create_sql = f"""
-                CREATE TABLE IF NOT EXISTS "{table}" (
-                    {", ".join(col_defs)}
-                );
-                """
+            pg_cur.execute(create_sql)
+            log(f"Created table: {table}")
 
-                conn.execute(text(create_sql))
-                conn.commit()
-                log(f"Created table: {table}")
+        except Exception as e:
+            log(f"Error creating table {table}: {e}")
+            raise
 
-            except Exception as e:
-                log(f"Error creating table {table}: {e}")
-                raise
+    pg_conn.commit()
 
 
-def migrate_table(mssql_engine, pg_engine, table: str) -> tuple:
-    """Migrate a single table from MSSQL to PostgreSQL."""
+def migrate_table(mssql_engine, pg_conn, table: str) -> tuple:
+    """Migrate a single table from MSSQL to PostgreSQL using COPY."""
     log(f"Migrating {table}...")
 
-    # Truncate target table before inserting
-    with pg_engine.begin() as conn:
-        conn.execute(text(f'TRUNCATE TABLE "{table}"'))
+    pg_cur = pg_conn.cursor()
 
-    # Read and transfer data in chunks
+    # Truncate target table before inserting
+    pg_cur.execute(f'TRUNCATE TABLE "{table}"')
+    pg_conn.commit()
+
+    # Read and transfer data in chunks using COPY
     rows_transferred = 0
-    for chunk in pd.read_sql(
-        f'SELECT * FROM PMS."{table}"', mssql_engine, chunksize=CHUNK_SIZE
-    ):
-        chunk.to_sql(
-            table,
-            pg_engine,
-            if_exists="append",
-            index=False,
-            method="multi",
+    query = f'SELECT * FROM PMS."{table}"'
+
+    for chunk in pd.read_sql(query, mssql_engine, chunksize=CHUNK_SIZE):
+        buffer = io.StringIO()
+        chunk.to_csv(buffer, index=False, header=False)
+        buffer.seek(0)
+
+        pg_cur.copy_expert(
+            f'COPY "{table}" FROM STDIN WITH CSV',
+            buffer
         )
+
+        pg_conn.commit()
         rows_transferred += len(chunk)
         log(f"  Transferred {rows_transferred} rows...")
 
@@ -159,16 +173,20 @@ def migrate_table(mssql_engine, pg_engine, table: str) -> tuple:
     return table, rows_transferred
 
 
-def verify_migration(mssql_engine, pg_engine, tables: list) -> bool:
+def verify_migration(mssql_engine, pg_conn, tables: list) -> bool:
     """Verify row counts match between MSSQL and PostgreSQL."""
     log("Verifying migration...")
     all_match = True
+
+    pg_cur = pg_conn.cursor()
 
     for table in tables:
         mssql_count = pd.read_sql(
             f'SELECT COUNT(*) c FROM PMS."{table}"', mssql_engine
         )["c"][0]
-        pg_count = pd.read_sql(f'SELECT COUNT(*) c FROM "{table}"', pg_engine)["c"][0]
+
+        pg_cur.execute(f'SELECT COUNT(*) FROM "{table}"')
+        pg_count = pg_cur.fetchone()[0]
 
         status = "OK" if mssql_count == pg_count else "MISMATCH"
         log(f"  {table}: MSSQL={mssql_count}, POSTGRES={pg_count} [{status}]")
@@ -203,15 +221,16 @@ def main():
     log(f"Starting migration: {mssql_db} -> {pg_db}")
     log(f"Tables to migrate: {', '.join(TABLES_REQUIRED)}")
 
+    pg_conn = None
     try:
-        # Create database engines
+        # Create database connections
         log("Connecting to MSSQL...")
         mssql_engine = create_mssql_engine(
             mssql_host, mssql_db, mssql_user, mssql_password
         )
 
         log("Connecting to PostgreSQL...")
-        pg_engine = create_pg_engine(pg_host, pg_port, pg_db, pg_user, pg_password)
+        pg_conn = create_pg_connection(pg_host, pg_port, pg_db, pg_user, pg_password)
 
         # Get schema information
         log("Fetching schema information...")
@@ -223,15 +242,15 @@ def main():
 
         # Create tables in PostgreSQL
         log("Creating tables in PostgreSQL...")
-        create_tables(pg_engine, schema_df)
+        create_tables(pg_conn, schema_df)
 
         # Migrate each table
         tables = schema_df["TABLE_NAME"].unique()
         for table in tables:
-            migrate_table(mssql_engine, pg_engine, table)
+            migrate_table(mssql_engine, pg_conn, table)
 
         # Verify migration
-        if verify_migration(mssql_engine, pg_engine, tables):
+        if verify_migration(mssql_engine, pg_conn, tables):
             log("Migration completed successfully!")
         else:
             log("WARNING: Row count mismatch detected!")
@@ -240,6 +259,10 @@ def main():
     except Exception as e:
         log(f"ERROR: Migration failed - {e}")
         sys.exit(1)
+
+    finally:
+        if pg_conn:
+            pg_conn.close()
 
 
 if __name__ == "__main__":
