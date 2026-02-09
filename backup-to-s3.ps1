@@ -4,6 +4,13 @@
 .DESCRIPTION
     Finds the latest .bak file from the configured directory and uploads it to S3
     using S3 Multipart Upload API for large file support (no AWS CLI required).
+    On upload failure, retries up to 3 times with exponential backoff. While running,
+    uploads the current log file to S3 every 30 seconds (same bucket, under prefix/logs/).
+.PARAMETER UploadLogOnly
+    Internal use: upload only the log file at -LogPath to S3 and exit. Used by the
+    background job that syncs logs every 30 seconds.
+.PARAMETER LogPath
+    Path to the log file when -UploadLogOnly is used.
 .NOTES
     Version: 3.0.0
     Requires: PowerShell 5.1+
@@ -12,7 +19,9 @@
 
 param(
     [string]$ConfigPath = "$PSScriptRoot\config.json",
-    [switch]$TestOnly
+    [switch]$TestOnly,
+    [switch]$UploadLogOnly,
+    [string]$LogPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +31,7 @@ $script:LogFile = $null
 $script:PartSizeMB = 100  # 100MB per part
 $script:PartSizeBytes = $script:PartSizeMB * 1MB
 $script:MaxRetries = 3
+$script:UploadMaxRetries = 3  # Whole-upload retries (distinct from per-part retries in Send-S3Part)
 
 #region ==================== LOGGING ====================
 
@@ -732,6 +742,38 @@ function Test-S3Connection {
     }
 }
 
+function Send-LogFileToS3 {
+    param(
+        [object]$Config,
+        [string]$LogFilePath
+    )
+    
+    if ([string]::IsNullOrEmpty($LogFilePath) -or -not (Test-Path $LogFilePath)) {
+        return
+    }
+    
+    $date = Get-Date -Format "yyyy-MM-dd"
+    $serverIdentifier = $Config.server_identifier
+    if ([string]::IsNullOrEmpty($serverIdentifier)) {
+        $serverIdentifier = $env:COMPUTERNAME
+    }
+    
+    $logKey = "$($Config.s3_prefix)/logs/$serverIdentifier/$date/backup-$date.log"
+    
+    try {
+        Send-S3SinglePut `
+            -BucketName $Config.s3_bucket `
+            -Key $logKey `
+            -FilePath $LogFilePath `
+            -AccessKey $Config.aws_access_key `
+            -SecretKey $Config.aws_secret_key `
+            -Region $Config.s3_region | Out-Null
+    }
+    catch {
+        # Silently ignore log upload failures (e.g. network blip) to avoid disrupting backup
+    }
+}
+
 #endregion
 
 #region ==================== RAR COMPRESSION ====================
@@ -988,15 +1030,41 @@ function Start-BakFileUpload {
     Write-Log "S3 Bucket: $($Config.s3_bucket)" "INFO"
     Write-Log "S3 Key: $s3Key" "INFO"
     
+    $uploadResult = $false
+    $lastError = $null
+    
     try {
-        # Upload to S3 using multipart upload
-        $uploadResult = Send-FileToS3 `
-            -BucketName $Config.s3_bucket `
-            -Key $s3Key `
-            -FilePath $fileToUpload.FullName `
-            -AccessKey $Config.aws_access_key `
-            -SecretKey $Config.aws_secret_key `
-            -Region $Config.s3_region
+        for ($attempt = 1; $attempt -le $script:UploadMaxRetries; $attempt++) {
+            try {
+                Write-Log "Upload attempt $attempt of $script:UploadMaxRetries" "INFO"
+                $uploadResult = Send-FileToS3 `
+                    -BucketName $Config.s3_bucket `
+                    -Key $s3Key `
+                    -FilePath $fileToUpload.FullName `
+                    -AccessKey $Config.aws_access_key `
+                    -SecretKey $Config.aws_secret_key `
+                    -Region $Config.s3_region
+                
+                if ($uploadResult) {
+                    break
+                }
+            }
+            catch {
+                $lastError = $_
+                if ($compressedFilePath -and (Test-Path $compressedFilePath)) {
+                    Write-Log "Upload failed - keeping compressed file for retry: $compressedFilePath" "WARN"
+                }
+                Write-Log "Upload attempt $attempt failed: $_" "WARN"
+                if ($attempt -lt $script:UploadMaxRetries) {
+                    $waitSeconds = [math]::Pow(2, $attempt)
+                    Write-Log "Retrying in $waitSeconds seconds..." "INFO"
+                    Start-Sleep -Seconds $waitSeconds
+                }
+                else {
+                    throw $lastError
+                }
+            }
+        }
         
         if ($uploadResult) {
             Write-Log "File uploaded successfully to S3" "SUCCESS"
@@ -1020,11 +1088,10 @@ function Start-BakFileUpload {
             }
         }
         else {
-            throw "Failed to upload file to S3"
+            if ($lastError) { throw $lastError } else { throw "Failed to upload file to S3" }
         }
     }
     catch {
-        # On upload failure, keep the compressed file for potential retry
         if ($compressedFilePath -and (Test-Path $compressedFilePath)) {
             Write-Log "Upload failed - keeping compressed file for retry: $compressedFilePath" "WARN"
         }
@@ -1044,6 +1111,15 @@ function Main {
         }
         
         $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        
+        # Upload-log-only mode: upload current log file to S3 and exit (used by background log sync job)
+        if ($UploadLogOnly) {
+            if ([string]::IsNullOrEmpty($LogPath) -or -not (Test-Path $LogPath)) {
+                exit 0
+            }
+            Send-LogFileToS3 -Config $config -LogFilePath $LogPath
+            exit 0
+        }
         
         # Initialize logging
         Initialize-Logging -LogDirectory $config.log_directory
@@ -1089,24 +1165,48 @@ function Main {
             exit 0
         }
         
-        # Start backup
-        $result = Start-BakFileUpload -Config $config
+        # Start background job to upload log file to S3 every 30 seconds
+        $logUploadStopFile = Join-Path $config.log_directory ".log-upload-stop-$pid"
+        $scriptPath = $PSCommandPath
+        $logUploadJob = Start-Job -ScriptBlock {
+            param($scriptPath, $logPath, $configPath, $stopFile)
+            do {
+                & $scriptPath -UploadLogOnly -LogPath $logPath -ConfigPath $configPath
+                Start-Sleep -Seconds 30
+            } while (-not (Test-Path $stopFile))
+        } -ArgumentList $scriptPath, $script:LogFile, $ConfigPath, $logUploadStopFile
         
-        # Print summary
-        Write-Log "=== Backup Complete ===" "SUCCESS"
-        Write-Log "Original File: $($result.original_file_name)" "INFO"
-        Write-Log "Uploaded File: $($result.uploaded_file_name)" "INFO"
-        if ($result.compression_enabled) {
-            Write-Log "Original Size: $($result.original_size_gb) GB -> Uploaded Size: $($result.uploaded_size_gb) GB" "INFO"
-            $compressionRatio = [math]::Round(($result.uploaded_size_mb / $result.original_size_mb) * 100, 1)
-            Write-Log "Compression Ratio: $compressionRatio% of original" "INFO"
+        $backupExitCode = 1
+        try {
+            # Start backup
+            $result = Start-BakFileUpload -Config $config
+            
+            # Print summary
+            Write-Log "=== Backup Complete ===" "SUCCESS"
+            Write-Log "Original File: $($result.original_file_name)" "INFO"
+            Write-Log "Uploaded File: $($result.uploaded_file_name)" "INFO"
+            if ($result.compression_enabled) {
+                Write-Log "Original Size: $($result.original_size_gb) GB -> Uploaded Size: $($result.uploaded_size_gb) GB" "INFO"
+                $compressionRatio = [math]::Round(($result.uploaded_size_mb / $result.original_size_mb) * 100, 1)
+                Write-Log "Compression Ratio: $compressionRatio% of original" "INFO"
+            }
+            else {
+                Write-Log "Size: $($result.uploaded_size_mb) MB ($($result.uploaded_size_gb) GB)" "INFO"
+            }
+            Write-Log "S3 Location: s3://$($config.s3_bucket)/$($result.s3_key)" "INFO"
+            
+            $backupExitCode = 0
         }
-        else {
-            Write-Log "Size: $($result.uploaded_size_mb) MB ($($result.uploaded_size_gb) GB)" "INFO"
+        finally {
+            # Signal log upload job to stop, wait for it, then upload final log
+            New-Item -Path $logUploadStopFile -ItemType File -Force | Out-Null
+            Wait-Job $logUploadJob | Out-Null
+            Remove-Job $logUploadJob -Force
+            Remove-Item $logUploadStopFile -Force -ErrorAction SilentlyContinue
+            Send-LogFileToS3 -Config $config -LogFilePath $script:LogFile
         }
-        Write-Log "S3 Location: s3://$($config.s3_bucket)/$($result.s3_key)" "INFO"
         
-        exit 0
+        exit $backupExitCode
     }
     catch {
         Write-Log "FATAL ERROR: $_" "ERROR"
