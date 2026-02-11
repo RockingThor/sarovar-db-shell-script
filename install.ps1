@@ -771,7 +771,7 @@ function Main {
     Write-Host "--- Creating Scheduled Task ---" -ForegroundColor Yellow
     Write-Host ""
     
-    $taskName = "SarovarBackup-BakToS3"
+    $taskName = "ASTechXSarovarBackup"
     $taskDescription = "Daily SQL Server BAK file upload to S3"
     
     # Parse backup time

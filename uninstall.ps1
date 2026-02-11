@@ -64,7 +64,7 @@ function Main {
     # Confirm uninstallation
     if (-not $Silent) {
         Write-Host "This will remove:" -ForegroundColor Yellow
-        Write-Host "  - Scheduled task: SarovarBackup-BakToS3" -ForegroundColor White
+        Write-Host "  - Scheduled task: ASTechXSarovarBackup" -ForegroundColor White
         Write-Host "  - Installation directory: $InstallPath" -ForegroundColor White
         if (-not $KeepLogs) {
             Write-Host "  - Log files" -ForegroundColor White
@@ -83,7 +83,7 @@ function Main {
     Write-Host ""
     
     # Remove scheduled task
-    $taskName = "SarovarBackup-BakToS3"
+    $taskName = "ASTechXSarovarBackup"
     Write-Status "Removing scheduled task..." "Info"
     
     $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
